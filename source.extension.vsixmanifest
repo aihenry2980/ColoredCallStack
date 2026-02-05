@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
-    <Identity Id="ColorCallStack.8db1c940-b9e7-4e5e-a2ba-5adce1e6b4c3" Version="1.1" Language="en-US" Publisher="JIN XIN" />
+    <Identity Id="ColorCallStack.8db1c940-b9e7-4e5e-a2ba-5adce1e6b4c3" Version="1.2" Language="en-US" Publisher="JIN XIN" />
     <DisplayName>ColorCallStack</DisplayName>
     <Description>A syntax highlighted call stack extension for Visual Studio 2022</Description>
     <Icon>Resources\ColoredCallStackIcon.png</Icon>
