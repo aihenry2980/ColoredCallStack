@@ -16,7 +16,16 @@
                  Background="{DynamicResource {x:Static vsshell:VsBrushes.WindowKey}}"
                  Foreground="{DynamicResource {x:Static vsshell:VsBrushes.WindowTextKey}}"
                  MouseDoubleClick="FramesList_OnMouseDoubleClick"
-                 SelectionChanged="FramesList_OnSelectionChanged">
+                 SelectionChanged="FramesList_OnSelectionChanged"
+                 ContextMenuOpening="FramesList_OnContextMenuOpening">
+            <ListBox.ContextMenu>
+                <ContextMenu>
+                    <MenuItem x:Name="MenuShowParameterTypes" Header="Show Parameter Types" IsCheckable="True" Click="MenuShowParameterTypes_OnClick" />
+                    <Separator />
+                    <MenuItem x:Name="MenuDisplayHex" Header="Display Hexadecimal" IsCheckable="True" Click="MenuDisplayHex_OnClick" />
+                    <MenuItem x:Name="MenuDisplayDecimal" Header="Display Decimal" IsCheckable="True" Click="MenuDisplayDecimal_OnClick" />
+                </ContextMenu>
+            </ListBox.ContextMenu>
             <ListBox.ItemContainerStyle>
                 <Style TargetType="ListBoxItem">
                     <Setter Property="Background" Value="Transparent" />
