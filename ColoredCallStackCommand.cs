@@ -99,6 +99,11 @@ namespace ColorCallStack
 
             IVsWindowFrame windowFrame = (IVsWindowFrame)window.Frame;
             Microsoft.VisualStudio.ErrorHandler.ThrowOnFailure(windowFrame.Show());
+
+            if (this.package is ColorCallStackPackage colorPackage)
+            {
+                colorPackage.RefreshCallStackForUserRequest();
+            }
         }
     }
 }

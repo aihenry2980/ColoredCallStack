@@ -16,11 +16,18 @@
                  Background="{DynamicResource {x:Static vsshell:VsBrushes.WindowKey}}"
                  Foreground="{DynamicResource {x:Static vsshell:VsBrushes.WindowTextKey}}"
                  MouseDoubleClick="FramesList_OnMouseDoubleClick"
+                 PreviewMouseWheel="FramesList_OnPreviewMouseWheel"
+                 PreviewKeyDown="FramesList_OnPreviewKeyDown"
                  SelectionChanged="FramesList_OnSelectionChanged"
                  ContextMenuOpening="FramesList_OnContextMenuOpening">
             <ListBox.ContextMenu>
                 <ContextMenu>
                     <MenuItem x:Name="MenuShowParameterTypes" Header="Show Parameter Types" IsCheckable="True" Click="MenuShowParameterTypes_OnClick" />
+                    <MenuItem x:Name="MenuShowLineNumbers" Header="Show Line Numbers" IsCheckable="True" Click="MenuShowLineNumbers_OnClick" />
+                    <MenuItem x:Name="MenuShowFilePath" Header="Show File Path" IsCheckable="True" Click="MenuShowFilePath_OnClick" />
+                    <Separator />
+                    <MenuItem x:Name="MenuFontIncrease" Header="Font ++" Click="MenuFontIncrease_OnClick" />
+                    <MenuItem x:Name="MenuFontDecrease" Header="Font --" Click="MenuFontDecrease_OnClick" />
                     <Separator />
                     <MenuItem x:Name="MenuDisplayHex" Header="Display Hexadecimal" IsCheckable="True" Click="MenuDisplayHex_OnClick" />
                     <MenuItem x:Name="MenuDisplayDecimal" Header="Display Decimal" IsCheckable="True" Click="MenuDisplayDecimal_OnClick" />

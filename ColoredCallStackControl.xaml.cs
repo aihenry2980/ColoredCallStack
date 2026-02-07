@@ -1,4 +1,5 @@
 using EnvDTE;
+using EnvDTE90a;
 using Microsoft.VisualStudio.Debugger.Interop;
 using Microsoft.VisualStudio.Imaging;
 using Microsoft.VisualStudio.PlatformUI;
@@ -7,12 +8,14 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Reflection;
 using Task = System.Threading.Tasks.Task;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Text.RegularExpressions;
 
 namespace ColorCallStack
 {
@@ -42,9 +45,11 @@ namespace ColorCallStack
         private List<StackFrame> _lastFrames;
         private StackFrame _lastCurrentFrame;
         private CallStackThemeMode _themeMode = CallStackThemeMode.Auto;
+        private bool _skipNextDetailsDelay;
 
         internal event EventHandler<StackFrame> FrameActivated;
         internal event EventHandler<DisplayOptionsChangedEventArgs> DisplayOptionsChanged;
+        internal event EventHandler<int> FontSizeStepRequested;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ColoredCallStackControl"/> class.
@@ -193,7 +198,6 @@ namespace ColorCallStack
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var arrow = new CrispImage
             {
@@ -227,7 +231,7 @@ namespace ColorCallStack
                 Margin = new Thickness(12, 0, 6, 0),
                 HorizontalAlignment = HorizontalAlignment.Right
             };
-            BuildFileInlines(fileText, frame, includeFileInfo: false);
+            BuildFileInlines(fileText, frame, includeFileInfo: true);
             Grid.SetColumn(fileText, 2);
 
             grid.Children.Add(arrow);
@@ -302,6 +306,23 @@ namespace ColorCallStack
                 AddRun(textBlock, ")", _punctuationBrush);
             }
 
+            AddInlineLineNumber(textBlock, frame);
+
+        }
+
+        private void AddInlineLineNumber(TextBlock textBlock, StackFrame frame)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (!_showLineNumbers || textBlock == null || frame == null)
+            {
+                return;
+            }
+
+            if (TryGetLineNumber(frame, out int line) && line > 0)
+            {
+                AddRun(textBlock, " Line ", _punctuationBrush);
+                AddRun(textBlock, line.ToString(), _lineBrush);
+            }
         }
 
         private void BuildFileInlines(TextBlock textBlock, StackFrame frame, bool includeFileInfo)
@@ -317,20 +338,20 @@ namespace ColorCallStack
                 return;
             }
 
-            if (TryGetFileInfo(frame, out string file, out int line))
+            if (TryGetFileInfo(frame, out string file, out int _))
             {
-                if (!_showFilePath && !_showLineNumbers)
+                if (!_showFilePath)
                 {
                     return;
                 }
 
-                string fileText = _showFilePath ? file : System.IO.Path.GetFileName(file);
-                AddRun(textBlock, fileText, _fileBrush);
-                if (_showLineNumbers)
+                string fileText = System.IO.Path.GetFileName(file);
+                if (string.IsNullOrEmpty(fileText))
                 {
-                    AddRun(textBlock, ":", _punctuationBrush);
-                    AddRun(textBlock, line.ToString(), _lineBrush);
+                    fileText = file;
                 }
+
+                AddRun(textBlock, fileText, _fileBrush);
             }
         }
 
@@ -347,6 +368,7 @@ namespace ColorCallStack
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             var arrow = new CrispImage
             {
@@ -369,6 +391,7 @@ namespace ColorCallStack
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
             AddRun(text, function, _functionBrush);
+            AddInlineLineNumber(text, frame);
             Grid.SetColumn(text, 1);
 
             var fileText = new TextBlock
@@ -380,6 +403,7 @@ namespace ColorCallStack
                 Margin = new Thickness(12, 0, 6, 0),
                 HorizontalAlignment = HorizontalAlignment.Right
             };
+            BuildFileInlines(fileText, frame, includeFileInfo: true);
             Grid.SetColumn(fileText, 2);
 
             grid.Children.Add(arrow);
@@ -499,6 +523,124 @@ namespace ColorCallStack
             }
         }
 
+        private static bool TryGetStringPropertyValue(object source, string propertyName, out string value)
+        {
+            value = null;
+            if (source == null || string.IsNullOrEmpty(propertyName))
+            {
+                return false;
+            }
+
+            try
+            {
+                PropertyInfo property = source.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+                if (property == null || !property.CanRead)
+                {
+                    return false;
+                }
+
+                object raw = property.GetValue(source);
+                value = raw as string ?? raw?.ToString();
+                return !string.IsNullOrEmpty(value);
+            }
+            catch
+            {
+                // Fall back to IDispatch-based access for COM-backed RCWs.
+            }
+
+            try
+            {
+                object raw = source.GetType().InvokeMember(
+                    propertyName,
+                    BindingFlags.GetProperty | BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase,
+                    binder: null,
+                    target: source,
+                    args: null);
+
+                value = raw as string ?? raw?.ToString();
+                return !string.IsNullOrEmpty(value);
+            }
+            catch
+            {
+                value = null;
+                return false;
+            }
+        }
+
+        private static bool TryGetIntPropertyValue(object source, string propertyName, out int value)
+        {
+            value = 0;
+            if (source == null || string.IsNullOrEmpty(propertyName))
+            {
+                return false;
+            }
+
+            try
+            {
+                PropertyInfo property = source.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+                if (property == null || !property.CanRead)
+                {
+                    return false;
+                }
+
+                object raw = property.GetValue(source);
+                switch (raw)
+                {
+                    case int intValue:
+                        value = intValue;
+                        return true;
+                    case short shortValue:
+                        value = shortValue;
+                        return true;
+                    case long longValue when longValue <= int.MaxValue && longValue >= int.MinValue:
+                        value = (int)longValue;
+                        return true;
+                    case uint uintValue when uintValue <= int.MaxValue:
+                        value = (int)uintValue;
+                        return true;
+                    default:
+                        return int.TryParse(raw?.ToString(), out value);
+                }
+            }
+            catch
+            {
+                // Fall back to IDispatch-based access for COM-backed RCWs.
+            }
+
+            try
+            {
+                object raw = source.GetType().InvokeMember(
+                    propertyName,
+                    BindingFlags.GetProperty | BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase,
+                    binder: null,
+                    target: source,
+                    args: null);
+
+                switch (raw)
+                {
+                    case int intValue:
+                        value = intValue;
+                        return true;
+                    case short shortValue:
+                        value = shortValue;
+                        return true;
+                    case long longValue when longValue <= int.MaxValue && longValue >= int.MinValue:
+                        value = (int)longValue;
+                        return true;
+                    case uint uintValue when uintValue <= int.MaxValue:
+                        value = (int)uintValue;
+                        return true;
+                    default:
+                        return int.TryParse(raw?.ToString(), out value);
+                }
+            }
+            catch
+            {
+                value = 0;
+                return false;
+            }
+        }
+
         private static bool TryGetFileInfo(StackFrame frame, out string file, out int line)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -509,24 +651,170 @@ namespace ColorCallStack
                 return false;
             }
 
+            if (TryGetFileInfoFromStackFrame2(frame, out file, out line))
+            {
+                return true;
+            }
+
+            if (TryGetStringPropertyValue(frame, "FileName", out string candidateFile))
+            {
+                file = candidateFile;
+            }
+
+            if (TryGetIntPropertyValue(frame, "LineNumber", out int candidateLine))
+            {
+                line = candidateLine;
+            }
+
+            if (!string.IsNullOrEmpty(file))
+            {
+                return true;
+            }
+
             if (TryGetFileInfoFromDebugFrame(frame, out file, out line))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryGetFileInfoFromStackFrame2(StackFrame frame, out string file, out int line)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            file = null;
+            line = 0;
+            if (!(frame is StackFrame2 frame2))
+            {
+                return false;
+            }
+
+            try
+            {
+                file = frame2.FileName;
+            }
+            catch
+            {
+                file = null;
+            }
+
+            try
+            {
+                line = unchecked((int)frame2.LineNumber);
+            }
+            catch
+            {
+                line = 0;
+            }
+
+            return !string.IsNullOrEmpty(file);
+        }
+
+        private static bool TryGetLineNumber(StackFrame frame, out int line)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            line = 0;
+            if (frame == null)
+            {
+                return false;
+            }
+
+            if (TryGetLineNumberFromStackFrame2(frame, out line))
+            {
+                return true;
+            }
+
+            if ((TryGetIntPropertyValue(frame, "LineNumber", out line) ||
+                 TryGetIntPropertyValue(frame, "Line", out line)) &&
+                line > 0)
+            {
+                return true;
+            }
+
+            if (TryGetLineNumberFromFrameText(frame, out line))
+            {
+                return true;
+            }
+
+            if (!TryGetDebugFrame(frame, out IDebugStackFrame2 debugFrame))
+            {
+                return false;
+            }
+
+            if (TryGetLineNumberFromFrameInfo(debugFrame, out line))
+            {
+                return true;
+            }
+
+            if (TryGetDocumentContext(debugFrame, out IDebugDocumentContext2 context) &&
+                TryGetLineNumberFromDocumentContext(context, out line))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetLineNumberFromStackFrame2(StackFrame frame, out int line)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            line = 0;
+            if (!(frame is StackFrame2 frame2))
+            {
+                return false;
+            }
+
+            try
+            {
+                line = unchecked((int)frame2.LineNumber);
+                return line > 0;
+            }
+            catch
+            {
+                line = 0;
+                return false;
+            }
+        }
+
+        private static bool TryGetLineNumberFromFrameText(StackFrame frame, out int line)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            line = 0;
+            if (frame == null)
+            {
+                return false;
+            }
+
+            if (TryGetStringPropertyValue(frame, "Name", out string frameName) &&
+                TryParseLineFromText(frameName, out line))
             {
                 return true;
             }
 
             try
             {
-                dynamic dyn = frame;
-                file = dyn.FileName as string;
-                line = (int)dyn.LineNumber;
-                return !string.IsNullOrEmpty(file) && line > 0;
+                if (TryParseLineFromText(frame.FunctionName, out line))
+                {
+                    return true;
+                }
             }
             catch
             {
-                file = null;
                 line = 0;
-                return false;
             }
+
+            try
+            {
+                if (TryParseLineFromText(frame.ToString(), out line))
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                line = 0;
+            }
+
+            return false;
         }
 
         private static bool TryGetFileInfoFromDebugFrame(StackFrame frame, out string file, out int line)
@@ -542,6 +830,11 @@ namespace ColorCallStack
 
             try
             {
+                if (TryGetFileInfoFromFrameInfo(debugFrame, out file, out line))
+                {
+                    return true;
+                }
+
                 if (!TryGetDocumentContext(debugFrame, out IDebugDocumentContext2 context))
                 {
                     return false;
@@ -555,6 +848,145 @@ namespace ColorCallStack
                 line = 0;
                 return false;
             }
+        }
+
+        private static bool TryGetFileInfoFromFrameInfo(IDebugStackFrame2 debugFrame, out string file, out int line)
+        {
+            file = null;
+            line = 0;
+            if (debugFrame == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var info = new FRAMEINFO[1];
+                var flags = enum_FRAMEINFO_FLAGS.FIF_FUNCNAME | enum_FRAMEINFO_FLAGS.FIF_FUNCNAME_LINES;
+                int hr = debugFrame.GetInfo(flags, 10, info);
+                if (!Microsoft.VisualStudio.ErrorHandler.Succeeded(hr) || info == null || info.Length == 0)
+                {
+                    return false;
+                }
+
+                string funcName = info[0].m_bstrFuncName;
+                return TryParseFileAndLineFromText(funcName, out file, out line);
+            }
+            catch
+            {
+                file = null;
+                line = 0;
+                return false;
+            }
+        }
+
+        private static bool TryGetLineNumberFromFrameInfo(IDebugStackFrame2 debugFrame, out int line)
+        {
+            line = 0;
+            if (debugFrame == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var info = new FRAMEINFO[1];
+                var flags = enum_FRAMEINFO_FLAGS.FIF_FUNCNAME | enum_FRAMEINFO_FLAGS.FIF_FUNCNAME_LINES;
+                int hr = debugFrame.GetInfo(flags, 10, info);
+                if (!Microsoft.VisualStudio.ErrorHandler.Succeeded(hr) || info == null || info.Length == 0)
+                {
+                    return false;
+                }
+
+                return TryParseLineFromText(info[0].m_bstrFuncName, out line);
+            }
+            catch
+            {
+                line = 0;
+                return false;
+            }
+        }
+
+        private static bool TryParseFileAndLineFromText(string text, out string file, out int line)
+        {
+            file = null;
+            line = 0;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            Match match = Regex.Match(text, @"(?<file>[A-Za-z]:\\[^:\r\n\)\]]+\.\w+)\((?<line>\d+)\)");
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[A-Za-z]:\\[^:\r\n\)\]]+\.\w+):(?<line>\d+)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>\\\\[^:\r\n\)\]]+\.\w+)\((?<line>\d+)\)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>\\\\[^:\r\n\)\]]+\.\w+):(?<line>\d+)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[^\\/:()\r\n\]]+\.\w+)\((?<line>\d+)\)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[^\\/:()\r\n\]]+\.\w+):(?<line>\d+)");
+            }
+
+            if (match.Success)
+            {
+                file = match.Groups["file"].Value;
+                int.TryParse(match.Groups["line"].Value, out line);
+                return !string.IsNullOrEmpty(file);
+            }
+
+            match = Regex.Match(text, @"(?<file>[A-Za-z]:\\[^:\r\n\)\]]+\.\w+)");
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>\\\\[^:\r\n\)\]]+\.\w+)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[^\\/:()\r\n\]]+\.\w+)");
+            }
+            if (match.Success)
+            {
+                file = match.Groups["file"].Value;
+                return !string.IsNullOrEmpty(file);
+            }
+
+            return false;
+        }
+
+        private static bool TryParseLineFromText(string text, out int line)
+        {
+            line = 0;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            Match match = Regex.Match(text, @"\bline\s+(?<line>\d+)\b", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"\((?<line>\d+)\)\s*$");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @":(?<line>\d+)\s*$");
+            }
+
+            if (!match.Success)
+            {
+                return false;
+            }
+
+            return int.TryParse(match.Groups["line"].Value, out line) && line > 0;
         }
 
         private static bool TryGetDocumentContext(IDebugStackFrame2 debugFrame, out IDebugDocumentContext2 context)
@@ -605,6 +1037,18 @@ namespace ColorCallStack
             {
                 file = baseName;
             }
+            if (string.IsNullOrEmpty(file) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_NAME, out string name)))
+            {
+                file = name;
+            }
+            if (string.IsNullOrEmpty(file) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_MONIKERNAME, out string moniker)))
+            {
+                file = moniker;
+            }
+            if (string.IsNullOrEmpty(file) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_TITLE, out string title)))
+            {
+                file = title;
+            }
 
             var begin = new TEXT_POSITION[1];
             var end = new TEXT_POSITION[1];
@@ -616,8 +1060,49 @@ namespace ColorCallStack
                     line = unchecked((int)lineValue) + 1;
                 }
             }
+            if (line <= 0 && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetSourceRange(begin, end)))
+            {
+                uint lineValue = begin[0].dwLine;
+                if (lineValue != uint.MaxValue)
+                {
+                    line = unchecked((int)lineValue) + 1;
+                }
+            }
 
-            return !string.IsNullOrEmpty(file) && line > 0;
+            return !string.IsNullOrEmpty(file);
+        }
+
+        private static bool TryGetLineNumberFromDocumentContext(IDebugDocumentContext2 context, out int line)
+        {
+            line = 0;
+            if (context == null)
+            {
+                return false;
+            }
+
+            var begin = new TEXT_POSITION[1];
+            var end = new TEXT_POSITION[1];
+            if (Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetStatementRange(begin, end)))
+            {
+                uint lineValue = begin[0].dwLine;
+                if (lineValue != uint.MaxValue)
+                {
+                    line = unchecked((int)lineValue) + 1;
+                    return line > 0;
+                }
+            }
+
+            if (Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetSourceRange(begin, end)))
+            {
+                uint lineValue = begin[0].dwLine;
+                if (lineValue != uint.MaxValue)
+                {
+                    line = unchecked((int)lineValue) + 1;
+                    return line > 0;
+                }
+            }
+
+            return false;
         }
 
         private static bool TryGetDebugFrame(StackFrame frame, out IDebugStackFrame2 debugFrame)
@@ -810,8 +1295,102 @@ namespace ColorCallStack
             }
 
             _showParameterTypes = isChecked;
-            UpdateCallStackIfAvailable();
+            UpdateCallStackIfAvailable(immediateDetails: true);
             DisplayOptionsChanged?.Invoke(this, DisplayOptionsChangedEventArgs.ForShowParameterTypes(isChecked));
+        }
+
+        private void MenuShowLineNumbers_OnClick(object sender, RoutedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            bool isChecked = MenuShowLineNumbers?.IsChecked ?? false;
+            if (_showLineNumbers == isChecked)
+            {
+                return;
+            }
+
+            _showLineNumbers = isChecked;
+            UpdateCallStackIfAvailable(immediateDetails: true);
+            DisplayOptionsChanged?.Invoke(this, DisplayOptionsChangedEventArgs.ForShowLineNumbers(isChecked));
+        }
+
+        private void MenuShowFilePath_OnClick(object sender, RoutedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            bool isChecked = MenuShowFilePath?.IsChecked ?? false;
+            if (_showFilePath == isChecked)
+            {
+                return;
+            }
+
+            _showFilePath = isChecked;
+            UpdateCallStackIfAvailable(immediateDetails: true);
+            DisplayOptionsChanged?.Invoke(this, DisplayOptionsChangedEventArgs.ForShowFilePath(isChecked));
+        }
+
+        private void MenuFontIncrease_OnClick(object sender, RoutedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            RequestFontSizeStep(1);
+        }
+
+        private void MenuFontDecrease_OnClick(object sender, RoutedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            RequestFontSizeStep(-1);
+        }
+
+        private void FramesList_OnPreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (!IsKeyboardFocusWithin)
+            {
+                return;
+            }
+
+            if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
+            {
+                return;
+            }
+
+            if (e.Delta > 0)
+            {
+                RequestFontSizeStep(1);
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Delta < 0)
+            {
+                RequestFontSizeStep(-1);
+                e.Handled = true;
+            }
+        }
+
+        private void FramesList_OnPreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (!IsKeyboardFocusWithin)
+            {
+                return;
+            }
+
+            if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
+            {
+                return;
+            }
+
+            if (e.Key == Key.OemPlus || e.Key == Key.Add || e.Key == Key.OemComma)
+            {
+                RequestFontSizeStep(1);
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Key == Key.OemMinus || e.Key == Key.Subtract)
+            {
+                RequestFontSizeStep(-1);
+                e.Handled = true;
+            }
         }
 
         private void MenuDisplayHex_OnClick(object sender, RoutedEventArgs e)
@@ -840,11 +1419,28 @@ namespace ColorCallStack
             DisplayOptionsChanged?.Invoke(this, DisplayOptionsChangedEventArgs.ForHexDisplayMode(hexDisplayMode));
         }
 
-        private void UpdateCallStackIfAvailable()
+        private void RequestFontSizeStep(int step)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (step == 0)
+            {
+                return;
+            }
+
+            _skipNextDetailsDelay = true;
+            FontSizeStepRequested?.Invoke(this, step);
+        }
+
+        private void UpdateCallStackIfAvailable(bool immediateDetails = false)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (_lastFrames != null)
             {
+                if (immediateDetails)
+                {
+                    _skipNextDetailsDelay = true;
+                }
+
                 UpdateCallStack(_lastFrames, _lastCurrentFrame);
             }
         }
@@ -855,6 +1451,16 @@ namespace ColorCallStack
             if (MenuShowParameterTypes != null)
             {
                 MenuShowParameterTypes.IsChecked = _showParameterTypes;
+            }
+
+            if (MenuShowLineNumbers != null)
+            {
+                MenuShowLineNumbers.IsChecked = _showLineNumbers;
+            }
+
+            if (MenuShowFilePath != null)
+            {
+                MenuShowFilePath.IsChecked = _showFilePath;
             }
 
             if (MenuDisplayHex != null)
@@ -900,39 +1506,9 @@ namespace ColorCallStack
 
             _detailsCts = new CancellationTokenSource();
             CancellationToken token = _detailsCts.Token;
-
-            ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
-            {
-                await Task.Delay(200, token);
-                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(token);
-                foreach (var item in items)
-                {
-                    token.ThrowIfCancellationRequested();
-                    if (item?.Tag is FrameRowInfo info)
-                    {
-                        try
-                        {
-                            if (info.FunctionText != null)
-                            {
-                                info.FunctionText.Inlines.Clear();
-                                BuildFrameInlines(info.FunctionText, info.Frame, includeArguments: true);
-                            }
-
-                            if (info.FileText != null)
-                            {
-                                info.FileText.Inlines.Clear();
-                                BuildFileInlines(info.FileText, info.Frame, includeFileInfo: true);
-                            }
-                        }
-                        catch
-                        {
-                            // Ignore per-frame failures to keep UI responsive.
-                        }
-                    }
-
-                    await Task.Yield();
-                }
-            }).FileAndForget("ColorCallStack/PopulateDetails");
+            int delayMs = _skipNextDetailsDelay ? 0 : 200;
+            _skipNextDetailsDelay = false;
+            PopulateDetailsAsync(items, token, delayMs).FileAndForget("ColorCallStack/PopulateDetails");
         }
 
         private void CancelDetailsPopulation()
@@ -943,6 +1519,42 @@ namespace ColorCallStack
                 _detailsCts.Cancel();
                 _detailsCts.Dispose();
                 _detailsCts = null;
+            }
+        }
+
+        private async Task PopulateDetailsAsync(IReadOnlyList<ListBoxItem> items, CancellationToken token, int delayMs)
+        {
+            if (delayMs > 0)
+            {
+                await Task.Delay(delayMs, token);
+            }
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync(token);
+            foreach (var item in items)
+            {
+                token.ThrowIfCancellationRequested();
+                if (item?.Tag is FrameRowInfo info)
+                {
+                    try
+                    {
+                        if (info.FunctionText != null)
+                        {
+                            info.FunctionText.Inlines.Clear();
+                            BuildFrameInlines(info.FunctionText, info.Frame, includeArguments: true);
+                        }
+
+                        if (info.FileText != null)
+                        {
+                            info.FileText.Inlines.Clear();
+                            BuildFileInlines(info.FileText, info.Frame, includeFileInfo: true);
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore per-frame failures to keep UI responsive.
+                    }
+                }
+
+                await Task.Yield();
             }
         }
 
@@ -1087,6 +1699,8 @@ namespace ColorCallStack
             public bool? HexDisplayMode { get; }
 
             public static DisplayOptionsChangedEventArgs ForShowParameterTypes(bool value) => new DisplayOptionsChangedEventArgs(value, null, null, null);
+            public static DisplayOptionsChangedEventArgs ForShowLineNumbers(bool value) => new DisplayOptionsChangedEventArgs(null, value, null, null);
+            public static DisplayOptionsChangedEventArgs ForShowFilePath(bool value) => new DisplayOptionsChangedEventArgs(null, null, value, null);
             public static DisplayOptionsChangedEventArgs ForHexDisplayMode(bool value) => new DisplayOptionsChangedEventArgs(null, null, null, value);
         }
     }

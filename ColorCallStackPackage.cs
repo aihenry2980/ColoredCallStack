@@ -1,4 +1,5 @@
 using EnvDTE;
+using EnvDTE90a;
 using EnvDTE80;
 using Microsoft;
 using Microsoft.VisualStudio;
@@ -9,6 +10,8 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Text.RegularExpressions;
+using System.Reflection;
 using Task = System.Threading.Tasks.Task;
 using DrawingColor = System.Drawing.Color;
 using MediaColor = System.Windows.Media.Color;
@@ -50,6 +53,18 @@ namespace ColorCallStack
         private ColoredCallStackControl _callStackControl;
         private bool _frameActivatedHooked;
         private bool _displayOptionsHooked;
+        private bool _fontSizeHooked;
+        private bool _fontSizeStepsLoaded;
+        private int _fontSizeSteps;
+        private int _emptyBreakRefreshRetries;
+        private CancellationTokenSource _refreshCts;
+        private const int ContextRefreshDebounceMs = 120;
+        private const int BreakRefreshDebounceMs = 250;
+        private const int RetryRefreshDebounceMs = 60;
+        private const int MaxEmptyBreakRefreshRetries = 40;
+        private const double FontStepDip = 1.0;
+        private const int MinFontSizeSteps = -8;
+        private const int MaxFontSizeSteps = 30;
         private static readonly Guid TextEditorFontCategory = new Guid("A27B4E24-A735-4D1D-B8E7-9716E1E3D8E0");
         private static readonly DrawingColor DefaultLightNamespaceColor = DrawingColor.FromArgb(255, 90, 96, 104);
         private static readonly DrawingColor DefaultLightFunctionColor = DrawingColor.FromArgb(255, 0, 82, 153);
@@ -94,28 +109,39 @@ namespace ColorCallStack
             await ColoredCallStackCommand.InitializeAsync(this);
         }
 
+        internal void RefreshCallStackForUserRequest()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            CancelPendingRefresh();
+            RefreshCallStack(onlyIfVisible: false);
+        }
+
         private void DebuggerEvents_OnEnterBreakMode(dbgEventReason Reason, ref dbgExecutionAction ExecutionAction)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            ShowToolWindow();
-            RefreshCallStack();
+            _emptyBreakRefreshRetries = 0;
+            QueueRefreshCallStack(onlyIfVisible: false, delayMs: BreakRefreshDebounceMs);
         }
 
         private void DebuggerEvents_OnContextChanged(EnvDTE.Process NewProcess, EnvDTE.Program NewProgram, EnvDTE.Thread NewThread, EnvDTE.StackFrame NewStackFrame)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            RefreshCallStack();
+            QueueRefreshCallStack(onlyIfVisible: true, delayMs: ContextRefreshDebounceMs);
         }
 
         private void DebuggerEvents_OnEnterRunMode(dbgEventReason Reason)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            ClearCallStack();
+            CancelPendingRefresh();
+            _emptyBreakRefreshRetries = 0;
+            // Keep last rendered frames while stepping to avoid UI churn on every F10.
         }
 
         private void DebuggerEvents_OnEnterDesignMode(dbgEventReason Reason)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            CancelPendingRefresh();
+            _emptyBreakRefreshRetries = 0;
             ClearCallStack();
         }
 
@@ -146,7 +172,7 @@ namespace ColorCallStack
                 if (TryGetFileInfo(frame, out string fileName, out int lineNumber))
                 {
                     _dte.ItemOperations.OpenFile(fileName);
-                    if (_dte.ActiveDocument?.Selection is TextSelection selection)
+                    if (lineNumber > 0 && _dte.ActiveDocument?.Selection is TextSelection selection)
                     {
                         selection.GotoLine(lineNumber, true);
                     }
@@ -157,14 +183,52 @@ namespace ColorCallStack
                 // Best-effort navigation; ignore failures.
             }
 
-            RefreshCallStack();
+            RefreshCallStack(onlyIfVisible: false);
         }
 
-        private void RefreshCallStack()
+        private void QueueRefreshCallStack(bool onlyIfVisible = true, int delayMs = ContextRefreshDebounceMs)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            var control = GetToolWindowControl(create: true);
+            CancelPendingRefresh();
+            _refreshCts = new CancellationTokenSource();
+            CancellationToken token = _refreshCts.Token;
+
+            JoinableTaskFactory.RunAsync(async () =>
+            {
+                await Task.Delay(delayMs, token);
+                await JoinableTaskFactory.SwitchToMainThreadAsync(token);
+                RefreshCallStack(onlyIfVisible);
+            }).FileAndForget("ColorCallStack/DebouncedRefresh");
+        }
+
+        private void CancelPendingRefresh()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (_refreshCts != null)
+            {
+                _refreshCts.Cancel();
+                _refreshCts.Dispose();
+                _refreshCts = null;
+            }
+        }
+
+        private void RefreshCallStack(bool onlyIfVisible)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var control = GetToolWindowControl(create: false);
             if (control == null || _dte?.Debugger == null)
+            {
+                if (_dte?.Debugger?.CurrentMode == dbgDebugMode.dbgBreakMode &&
+                    _emptyBreakRefreshRetries < MaxEmptyBreakRefreshRetries)
+                {
+                    _emptyBreakRefreshRetries++;
+                    QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
+                }
+
+                return;
+            }
+
+            if (onlyIfVisible && !IsToolWindowVisible())
             {
                 return;
             }
@@ -177,17 +241,66 @@ namespace ColorCallStack
             EnvDTE.Thread thread = _dte.Debugger.CurrentThread;
             if (thread == null)
             {
+                if (_dte.Debugger.CurrentMode == dbgDebugMode.dbgBreakMode &&
+                    _emptyBreakRefreshRetries < MaxEmptyBreakRefreshRetries)
+                {
+                    _emptyBreakRefreshRetries++;
+                    QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
+                    return;
+                }
+
+                _emptyBreakRefreshRetries = 0;
                 control.ClearCallStack();
                 return;
             }
 
             var frames = new List<StackFrame>();
-            foreach (StackFrame frame in thread.StackFrames)
+            try
             {
-                frames.Add(frame);
+                foreach (StackFrame frame in thread.StackFrames)
+                {
+                    frames.Add(frame);
+                }
+            }
+            catch
+            {
+                if (_dte.Debugger.CurrentMode == dbgDebugMode.dbgBreakMode &&
+                    _emptyBreakRefreshRetries < MaxEmptyBreakRefreshRetries)
+                {
+                    _emptyBreakRefreshRetries++;
+                    QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
+                    return;
+                }
+
+                _emptyBreakRefreshRetries = 0;
+                control.ClearCallStack();
+                return;
             }
 
+            if (frames.Count == 0 && _dte.Debugger.CurrentMode == dbgDebugMode.dbgBreakMode)
+            {
+                if (_emptyBreakRefreshRetries < MaxEmptyBreakRefreshRetries)
+                {
+                    _emptyBreakRefreshRetries++;
+                    QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
+                    return;
+                }
+            }
+
+            _emptyBreakRefreshRetries = 0;
             control.UpdateCallStack(frames, _dte.Debugger.CurrentStackFrame);
+        }
+
+        private bool IsToolWindowVisible()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            ToolWindowPane window = FindToolWindow(typeof(ColoredCallStack), 0, false);
+            if (!(window?.Frame is IVsWindowFrame frame))
+            {
+                return false;
+            }
+
+            return frame.IsVisible() == VSConstants.S_OK;
         }
 
         private void ClearCallStack()
@@ -195,16 +308,6 @@ namespace ColorCallStack
             ThreadHelper.ThrowIfNotOnUIThread();
             var control = GetToolWindowControl(create: false);
             control?.ClearCallStack();
-        }
-
-        private void ShowToolWindow()
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-            ToolWindowPane window = FindToolWindow(typeof(ColoredCallStack), 0, true);
-            if (window?.Frame is IVsWindowFrame windowFrame)
-            {
-                Microsoft.VisualStudio.ErrorHandler.ThrowOnFailure(windowFrame.Show());
-            }
         }
 
         private ColoredCallStackControl GetToolWindowControl(bool create)
@@ -227,6 +330,11 @@ namespace ColorCallStack
                     _callStackControl.DisplayOptionsChanged += Control_DisplayOptionsChanged;
                     _displayOptionsHooked = true;
                 }
+                if (!_fontSizeHooked)
+                {
+                    _callStackControl.FontSizeStepRequested += Control_FontSizeStepRequested;
+                    _fontSizeHooked = true;
+                }
 
                 return _callStackControl;
             }
@@ -236,7 +344,7 @@ namespace ColorCallStack
 
         private void Options_ThemeModeChanged(object sender, EventArgs e)
         {
-            _ = JoinableTaskFactory.RunAsync(async () =>
+            JoinableTaskFactory.RunAsync(async () =>
             {
                 await JoinableTaskFactory.SwitchToMainThreadAsync();
                 var control = GetToolWindowControl(create: false);
@@ -248,8 +356,8 @@ namespace ColorCallStack
                 ApplyPalette(control);
                 ApplyDisplayOptions(control);
                 ApplyThemeMode(control);
-                RefreshCallStack();
-            });
+                RefreshCallStack(onlyIfVisible: false);
+            }).FileAndForget("ColorCallStack/ApplyOptions");
         }
 
         private void ApplyThemeMode(ColoredCallStackControl control)
@@ -275,8 +383,8 @@ namespace ColorCallStack
 
             var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
             bool showParameterTypes = options?.ShowParameterTypes ?? false;
-            bool showLineNumbers = true;
-            bool showFilePath = false;
+            bool showLineNumbers = options?.ShowLineNumbers ?? true;
+            bool showFilePath = options?.ShowFilePath ?? true;
             bool hexDisplayMode = _dte?.Debugger != null && _dte.Debugger.HexDisplayMode;
 
             control.SetDisplayOptions(showParameterTypes, showLineNumbers, showFilePath, hexDisplayMode);
@@ -284,7 +392,23 @@ namespace ColorCallStack
 
         private void Control_DisplayOptionsChanged(object sender, ColoredCallStackControl.DisplayOptionsChangedEventArgs e)
         {
+            if (!ThreadHelper.CheckAccess())
+            {
+                JoinableTaskFactory.RunAsync(async () =>
+                {
+                    await JoinableTaskFactory.SwitchToMainThreadAsync();
+                    Control_DisplayOptionsChangedCore(e);
+                }).FileAndForget("ColorCallStack/DisplayOptionsChanged");
+                return;
+            }
+
+            Control_DisplayOptionsChangedCore(e);
+        }
+
+        private void Control_DisplayOptionsChangedCore(ColoredCallStackControl.DisplayOptionsChangedEventArgs e)
+        {
             ThreadHelper.ThrowIfNotOnUIThread();
+
             var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
             if (options == null)
             {
@@ -295,6 +419,19 @@ namespace ColorCallStack
             if (e.ShowParameterTypes.HasValue)
             {
                 options.ShowParameterTypes = e.ShowParameterTypes.Value;
+                refreshNeeded = true;
+            }
+
+            if (e.ShowLineNumbers.HasValue)
+            {
+                options.ShowLineNumbers = e.ShowLineNumbers.Value;
+                refreshNeeded = true;
+            }
+
+            if (e.ShowFilePath.HasValue)
+            {
+                options.ShowFilePath = e.ShowFilePath.Value;
+                refreshNeeded = true;
             }
 
             if (e.HexDisplayMode.HasValue && _dte?.Debugger != null)
@@ -313,7 +450,42 @@ namespace ColorCallStack
 
             if (refreshNeeded)
             {
-                RefreshCallStack();
+                CancelPendingRefresh();
+                RefreshCallStack(onlyIfVisible: false);
+            }
+        }
+
+        private void Control_FontSizeStepRequested(object sender, int stepDelta)
+        {
+            if (!ThreadHelper.CheckAccess())
+            {
+                JoinableTaskFactory.RunAsync(async () =>
+                {
+                    await JoinableTaskFactory.SwitchToMainThreadAsync();
+                    Control_FontSizeStepRequestedCore(stepDelta);
+                }).FileAndForget("ColorCallStack/FontSizeStepRequested");
+                return;
+            }
+
+            Control_FontSizeStepRequestedCore(stepDelta);
+        }
+
+        private void Control_FontSizeStepRequestedCore(int stepDelta)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (stepDelta == 0)
+            {
+                return;
+            }
+
+            EnsureFontSizeStepsLoaded();
+            _fontSizeSteps = ClampInt(_fontSizeSteps + stepDelta, MinFontSizeSteps, MaxFontSizeSteps);
+            PersistFontSizeSteps();
+            var control = GetToolWindowControl(create: false);
+            if (control != null)
+            {
+                ApplyTextEditorFont(control);
             }
         }
 
@@ -360,10 +532,38 @@ namespace ColorCallStack
                 return;
             }
 
+            EnsureFontSizeStepsLoaded();
             if (TryGetTextEditorFont(out string family, out double size))
             {
-                control.SetFont(family, size);
+                double adjustedSize = Math.Max(1.0, size + (_fontSizeSteps * FontStepDip));
+                control.SetFont(family, adjustedSize);
             }
+        }
+
+        private void EnsureFontSizeStepsLoaded()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (_fontSizeStepsLoaded)
+            {
+                return;
+            }
+
+            var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
+            _fontSizeSteps = ClampInt(options?.FontSizeAdjustmentSteps ?? 0, MinFontSizeSteps, MaxFontSizeSteps);
+            _fontSizeStepsLoaded = true;
+        }
+
+        private void PersistFontSizeSteps()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
+            if (options == null || options.FontSizeAdjustmentSteps == _fontSizeSteps)
+            {
+                return;
+            }
+
+            options.FontSizeAdjustmentSteps = _fontSizeSteps;
+            options.SaveSettingsToStorage();
         }
 
         private static MediaColor ToMediaColor(DrawingColor color)
@@ -374,6 +574,21 @@ namespace ColorCallStack
         private static DrawingColor NormalizeColor(DrawingColor value, DrawingColor fallback)
         {
             return value.IsEmpty ? fallback : value;
+        }
+
+        private static int ClampInt(int value, int min, int max)
+        {
+            if (value < min)
+            {
+                return min;
+            }
+
+            if (value > max)
+            {
+                return max;
+            }
+
+            return value;
         }
 
         private bool TryGetTextEditorFont(out string fontFamily, out double fontSize)
@@ -433,22 +648,178 @@ namespace ColorCallStack
                 return false;
             }
 
-            if (TryGetFileInfoFromDebugFrame(frame, out fileName, out lineNumber))
+            if (TryGetFileInfoFromStackFrame2(frame, out fileName, out lineNumber))
             {
                 return true;
             }
 
+            if (TryGetStringPropertyValue(frame, "FileName", out string candidateFile))
+            {
+                fileName = candidateFile;
+            }
+
+            if (TryGetIntPropertyValue(frame, "LineNumber", out int candidateLine))
+            {
+                lineNumber = candidateLine;
+            }
+
+            if (!string.IsNullOrEmpty(fileName))
+            {
+                return true;
+            }
+
+            if (TryGetFileInfoFromDebugFrame(frame, out fileName, out lineNumber))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        private static bool TryGetFileInfoFromStackFrame2(StackFrame frame, out string fileName, out int lineNumber)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            fileName = null;
+            lineNumber = 0;
+            if (!(frame is StackFrame2 frame2))
+            {
+                return false;
+            }
+
             try
             {
-                dynamic dyn = frame;
-                fileName = dyn.FileName as string;
-                lineNumber = (int)dyn.LineNumber;
-                return !string.IsNullOrEmpty(fileName) && lineNumber > 0;
+                fileName = frame2.FileName;
             }
             catch
             {
                 fileName = null;
+            }
+
+            try
+            {
+                lineNumber = unchecked((int)frame2.LineNumber);
+            }
+            catch
+            {
                 lineNumber = 0;
+            }
+
+            return !string.IsNullOrEmpty(fileName);
+        }
+
+        private static bool TryGetStringPropertyValue(object source, string propertyName, out string value)
+        {
+            value = null;
+            if (source == null || string.IsNullOrEmpty(propertyName))
+            {
+                return false;
+            }
+
+            try
+            {
+                PropertyInfo property = source.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+                if (property == null || !property.CanRead)
+                {
+                    return false;
+                }
+
+                object raw = property.GetValue(source);
+                value = raw as string ?? raw?.ToString();
+                return !string.IsNullOrEmpty(value);
+            }
+            catch
+            {
+                // Fall back to IDispatch-based access for COM-backed RCWs.
+            }
+
+            try
+            {
+                object raw = source.GetType().InvokeMember(
+                    propertyName,
+                    BindingFlags.GetProperty | BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase,
+                    binder: null,
+                    target: source,
+                    args: null);
+
+                value = raw as string ?? raw?.ToString();
+                return !string.IsNullOrEmpty(value);
+            }
+            catch
+            {
+                value = null;
+                return false;
+            }
+        }
+
+        private static bool TryGetIntPropertyValue(object source, string propertyName, out int value)
+        {
+            value = 0;
+            if (source == null || string.IsNullOrEmpty(propertyName))
+            {
+                return false;
+            }
+
+            try
+            {
+                PropertyInfo property = source.GetType().GetProperty(propertyName, BindingFlags.Instance | BindingFlags.Public);
+                if (property == null || !property.CanRead)
+                {
+                    return false;
+                }
+
+                object raw = property.GetValue(source);
+                switch (raw)
+                {
+                    case int intValue:
+                        value = intValue;
+                        return true;
+                    case short shortValue:
+                        value = shortValue;
+                        return true;
+                    case long longValue when longValue <= int.MaxValue && longValue >= int.MinValue:
+                        value = (int)longValue;
+                        return true;
+                    case uint uintValue when uintValue <= int.MaxValue:
+                        value = (int)uintValue;
+                        return true;
+                    default:
+                        return int.TryParse(raw?.ToString(), out value);
+                }
+            }
+            catch
+            {
+                // Fall back to IDispatch-based access for COM-backed RCWs.
+            }
+
+            try
+            {
+                object raw = source.GetType().InvokeMember(
+                    propertyName,
+                    BindingFlags.GetProperty | BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase,
+                    binder: null,
+                    target: source,
+                    args: null);
+
+                switch (raw)
+                {
+                    case int intValue:
+                        value = intValue;
+                        return true;
+                    case short shortValue:
+                        value = shortValue;
+                        return true;
+                    case long longValue when longValue <= int.MaxValue && longValue >= int.MinValue:
+                        value = (int)longValue;
+                        return true;
+                    case uint uintValue when uintValue <= int.MaxValue:
+                        value = (int)uintValue;
+                        return true;
+                    default:
+                        return int.TryParse(raw?.ToString(), out value);
+                }
+            }
+            catch
+            {
+                value = 0;
                 return false;
             }
         }
@@ -466,12 +837,47 @@ namespace ColorCallStack
 
             try
             {
+                if (TryGetFileInfoFromFrameInfo(debugFrame, out fileName, out lineNumber))
+                {
+                    return true;
+                }
+
                 if (!TryGetDocumentContext(debugFrame, out IDebugDocumentContext2 context))
                 {
                     return false;
                 }
 
                 return TryGetFileInfoFromDocumentContext(context, out fileName, out lineNumber);
+            }
+            catch
+            {
+                fileName = null;
+                lineNumber = 0;
+                return false;
+            }
+        }
+
+        private static bool TryGetFileInfoFromFrameInfo(IDebugStackFrame2 debugFrame, out string fileName, out int lineNumber)
+        {
+            fileName = null;
+            lineNumber = 0;
+            if (debugFrame == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                var info = new FRAMEINFO[1];
+                var flags = enum_FRAMEINFO_FLAGS.FIF_FUNCNAME | enum_FRAMEINFO_FLAGS.FIF_FUNCNAME_LINES;
+                int hr = debugFrame.GetInfo(flags, 10, info);
+                if (!Microsoft.VisualStudio.ErrorHandler.Succeeded(hr) || info == null || info.Length == 0)
+                {
+                    return false;
+                }
+
+                string funcName = info[0].m_bstrFuncName;
+                return TryParseFileAndLineFromText(funcName, out fileName, out lineNumber);
             }
             catch
             {
@@ -524,6 +930,22 @@ namespace ColorCallStack
             {
                 fileName = urlName;
             }
+            if (string.IsNullOrEmpty(fileName) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_BASENAME, out string baseName)))
+            {
+                fileName = baseName;
+            }
+            if (string.IsNullOrEmpty(fileName) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_NAME, out string name)))
+            {
+                fileName = name;
+            }
+            if (string.IsNullOrEmpty(fileName) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_MONIKERNAME, out string moniker)))
+            {
+                fileName = moniker;
+            }
+            if (string.IsNullOrEmpty(fileName) && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetName(enum_GETNAME_TYPE.GN_TITLE, out string title)))
+            {
+                fileName = title;
+            }
 
             var begin = new TEXT_POSITION[1];
             var end = new TEXT_POSITION[1];
@@ -535,8 +957,72 @@ namespace ColorCallStack
                     lineNumber = unchecked((int)lineValue) + 1;
                 }
             }
+            if (lineNumber <= 0 && Microsoft.VisualStudio.ErrorHandler.Succeeded(context.GetSourceRange(begin, end)))
+            {
+                uint lineValue = begin[0].dwLine;
+                if (lineValue != uint.MaxValue)
+                {
+                    lineNumber = unchecked((int)lineValue) + 1;
+                }
+            }
 
-            return !string.IsNullOrEmpty(fileName) && lineNumber > 0;
+            return !string.IsNullOrEmpty(fileName);
+        }
+
+        private static bool TryParseFileAndLineFromText(string text, out string fileName, out int lineNumber)
+        {
+            fileName = null;
+            lineNumber = 0;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            Match match = Regex.Match(text, @"(?<file>[A-Za-z]:\\[^:\r\n\)\]]+\.\w+)\((?<line>\d+)\)");
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[A-Za-z]:\\[^:\r\n\)\]]+\.\w+):(?<line>\d+)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>\\\\[^:\r\n\)\]]+\.\w+)\((?<line>\d+)\)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>\\\\[^:\r\n\)\]]+\.\w+):(?<line>\d+)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[^\\/:()\r\n\]]+\.\w+)\((?<line>\d+)\)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[^\\/:()\r\n\]]+\.\w+):(?<line>\d+)");
+            }
+
+            if (match.Success)
+            {
+                fileName = match.Groups["file"].Value;
+                int.TryParse(match.Groups["line"].Value, out lineNumber);
+                return !string.IsNullOrEmpty(fileName);
+            }
+
+            match = Regex.Match(text, @"(?<file>[A-Za-z]:\\[^:\r\n\)\]]+\.\w+)");
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>\\\\[^:\r\n\)\]]+\.\w+)");
+            }
+            if (!match.Success)
+            {
+                match = Regex.Match(text, @"(?<file>[^\\/:()\r\n\]]+\.\w+)");
+            }
+            if (match.Success)
+            {
+                fileName = match.Groups["file"].Value;
+                return !string.IsNullOrEmpty(fileName);
+            }
+
+            return false;
         }
 
         private static bool TryGetDebugFrame(StackFrame frame, out IDebugStackFrame2 debugFrame)

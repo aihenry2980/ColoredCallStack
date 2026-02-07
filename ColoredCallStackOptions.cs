@@ -16,6 +16,9 @@ namespace ColorCallStack
     {
         private CallStackThemeMode _themeMode = CallStackThemeMode.Auto;
         private bool _showParameterTypes;
+        private bool _showLineNumbers = true;
+        private bool _showFilePath = true;
+        private int _fontSizeAdjustmentSteps;
         private Color _lightNamespaceColor = Color.FromArgb(255, 90, 96, 104);
         private Color _lightFunctionColor = Color.FromArgb(255, 0, 82, 153);
         private Color _lightParamNameColor = Color.FromArgb(255, 122, 63, 0);
@@ -51,6 +54,34 @@ namespace ColorCallStack
         {
             get => _showParameterTypes;
             set => _showParameterTypes = value;
+        }
+
+        [Category("Display")]
+        [DisplayName("Show Line Numbers")]
+        [Description("Show line numbers in the call stack when available.")]
+        [DefaultValue(true)]
+        public bool ShowLineNumbers
+        {
+            get => _showLineNumbers;
+            set => _showLineNumbers = value;
+        }
+
+        [Category("Display")]
+        [DisplayName("Show File Path")]
+        [Description("Show full file path instead of file name in the call stack when available.")]
+        [DefaultValue(true)]
+        public bool ShowFilePath
+        {
+            get => _showFilePath;
+            set => _showFilePath = value;
+        }
+
+        [Browsable(false)]
+        [DefaultValue(0)]
+        public int FontSizeAdjustmentSteps
+        {
+            get => _fontSizeAdjustmentSteps;
+            set => _fontSizeAdjustmentSteps = value;
         }
 
         [Category("Light Theme")]
@@ -182,6 +213,7 @@ namespace ColorCallStack
         protected override void OnApply(PageApplyEventArgs e)
         {
             base.OnApply(e);
+            SaveSettingsToStorage();
             ThemeModeChanged?.Invoke(this, EventArgs.Empty);
         }
     }
