@@ -3,5 +3,7 @@ Original Call Stack Window
 
 
 Colored Call Stack
-<img width="833" height="386" alt="image" src="https://github.com/user-attachments/assets/50a272fe-ebee-49f7-a96f-c3c7bc59671d" />
+<img width="1322" height="381" alt="image" src="https://github.com/user-attachments/assets/74ff4432-f2ac-4b6d-b494-3cddc18040ed" />
+<img width="1029" height="1276" alt="image" src="https://github.com/user-attachments/assets/6bc434f9-7257-47f7-9acf-1d5cfa67c06b" />
+
 
