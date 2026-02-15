@@ -1,3 +1,5 @@
+https://marketplace.visualstudio.com/items?itemName=podeba.ccs1
+
 Original Call Stack Window
 <img width="849" height="390" alt="image" src="https://github.com/user-attachments/assets/f662512c-46e7-4e5c-8d4b-0f11b98d3e8c" />
 
