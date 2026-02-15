@@ -36,10 +36,26 @@ namespace ColorCallStack
         private double _fontSize = 12.0;
         private Palette _lightPalette = LightPalette;
         private Palette _darkPalette = DarkPalette;
+        private bool _showNamespace = true;
         private bool _showParameterTypes;
         private bool _showLineNumbers = true;
         private bool _showFilePath;
         private bool _hexDisplayMode = true;
+        private double _namespaceFontScale = 1.0;
+        private double _functionFontScale = 1.0;
+        private double _parameterFontScale = 1.0;
+        private double _lineFontScale = 1.0;
+        private double _fileFontScale = 1.0;
+        private string _namespaceFontFamilyName;
+        private string _functionFontFamilyName;
+        private string _parameterFontFamilyName;
+        private string _lineFontFamilyName;
+        private string _fileFontFamilyName;
+        private FontFamily _namespaceFontFamily;
+        private FontFamily _functionFontFamily;
+        private FontFamily _parameterFontFamily;
+        private FontFamily _lineFontFamily;
+        private FontFamily _fileFontFamily;
         private CancellationTokenSource _detailsCts;
         private bool _themeHooked;
         private List<StackFrame> _lastFrames;
@@ -50,6 +66,7 @@ namespace ColorCallStack
         internal event EventHandler<StackFrame> FrameActivated;
         internal event EventHandler<DisplayOptionsChangedEventArgs> DisplayOptionsChanged;
         internal event EventHandler<int> FontSizeStepRequested;
+        internal event EventHandler ResetRequested;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ColoredCallStackControl"/> class.
@@ -91,14 +108,16 @@ namespace ColorCallStack
             }
         }
 
-        internal void SetDisplayOptions(bool showParameterTypes, bool showLineNumbers, bool showFilePath, bool hexDisplayMode)
+        internal void SetDisplayOptions(bool showNamespace, bool showParameterTypes, bool showLineNumbers, bool showFilePath, bool hexDisplayMode)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            bool changed = _showParameterTypes != showParameterTypes ||
+            bool changed = _showNamespace != showNamespace ||
+                           _showParameterTypes != showParameterTypes ||
                            _showLineNumbers != showLineNumbers ||
                            _showFilePath != showFilePath ||
                            _hexDisplayMode != hexDisplayMode;
 
+            _showNamespace = showNamespace;
             _showParameterTypes = showParameterTypes;
             _showLineNumbers = showLineNumbers;
             _showFilePath = showFilePath;
@@ -106,6 +125,78 @@ namespace ColorCallStack
             UpdateContextMenuChecks();
 
             if (changed && _lastFrames != null)
+            {
+                UpdateCallStack(_lastFrames, _lastCurrentFrame);
+            }
+        }
+
+        internal void SetTokenFontScales(double namespaceScale, double functionScale, double parameterScale)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            SetTokenFontScales(namespaceScale, functionScale, parameterScale, 1.0, 1.0);
+        }
+
+        internal void SetTokenFontScales(double namespaceScale, double functionScale, double parameterScale, double lineScale, double fileScale)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            namespaceScale = ClampScale(namespaceScale);
+            functionScale = ClampScale(functionScale);
+            parameterScale = ClampScale(parameterScale);
+            lineScale = ClampScale(lineScale);
+            fileScale = ClampScale(fileScale);
+
+            if (Math.Abs(_namespaceFontScale - namespaceScale) < 0.001 &&
+                Math.Abs(_functionFontScale - functionScale) < 0.001 &&
+                Math.Abs(_parameterFontScale - parameterScale) < 0.001 &&
+                Math.Abs(_lineFontScale - lineScale) < 0.001 &&
+                Math.Abs(_fileFontScale - fileScale) < 0.001)
+            {
+                return;
+            }
+
+            _namespaceFontScale = namespaceScale;
+            _functionFontScale = functionScale;
+            _parameterFontScale = parameterScale;
+            _lineFontScale = lineScale;
+            _fileFontScale = fileScale;
+
+            if (_lastFrames != null)
+            {
+                UpdateCallStack(_lastFrames, _lastCurrentFrame);
+            }
+        }
+
+        internal void SetTokenFontFamilies(string namespaceFontFamily, string functionFontFamily, string parameterFontFamily, string lineFontFamily, string fileFontFamily)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            string normalizedNamespace = NormalizeFontFamilyName(namespaceFontFamily);
+            string normalizedFunction = NormalizeFontFamilyName(functionFontFamily);
+            string normalizedParameter = NormalizeFontFamilyName(parameterFontFamily);
+            string normalizedLine = NormalizeFontFamilyName(lineFontFamily);
+            string normalizedFile = NormalizeFontFamilyName(fileFontFamily);
+
+            if (string.Equals(_namespaceFontFamilyName, normalizedNamespace, StringComparison.Ordinal) &&
+                string.Equals(_functionFontFamilyName, normalizedFunction, StringComparison.Ordinal) &&
+                string.Equals(_parameterFontFamilyName, normalizedParameter, StringComparison.Ordinal) &&
+                string.Equals(_lineFontFamilyName, normalizedLine, StringComparison.Ordinal) &&
+                string.Equals(_fileFontFamilyName, normalizedFile, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _namespaceFontFamilyName = normalizedNamespace;
+            _functionFontFamilyName = normalizedFunction;
+            _parameterFontFamilyName = normalizedParameter;
+            _lineFontFamilyName = normalizedLine;
+            _fileFontFamilyName = normalizedFile;
+
+            _namespaceFontFamily = CreateFontFamilyOrNull(_namespaceFontFamilyName);
+            _functionFontFamily = CreateFontFamilyOrNull(_functionFontFamilyName);
+            _parameterFontFamily = CreateFontFamilyOrNull(_parameterFontFamilyName);
+            _lineFontFamily = CreateFontFamilyOrNull(_lineFontFamilyName);
+            _fileFontFamily = CreateFontFamilyOrNull(_fileFontFamilyName);
+
+            if (_lastFrames != null)
             {
                 UpdateCallStack(_lastFrames, _lastCurrentFrame);
             }
@@ -265,12 +356,12 @@ namespace ColorCallStack
             string function = GetSafeFunctionName(frame);
             SplitFunctionName(function, out string namespacePart, out string functionPart);
 
-            if (!string.IsNullOrEmpty(namespacePart))
+            if (_showNamespace && !string.IsNullOrEmpty(namespacePart))
             {
-                AddRun(textBlock, namespacePart, _namespaceBrush);
+                AddRun(textBlock, namespacePart, _namespaceBrush, _namespaceFontScale, _namespaceFontFamily);
             }
 
-            AddRun(textBlock, functionPart, _functionBrush);
+            AddRun(textBlock, functionPart, _functionBrush, _functionFontScale, _functionFontFamily);
 
             if (includeArguments && TryGetArguments(frame.Arguments, out List<ArgumentPart> args) && args.Count > 0)
             {
@@ -285,22 +376,22 @@ namespace ColorCallStack
                     ArgumentPart arg = args[i];
                     if (_showParameterTypes && !string.IsNullOrEmpty(arg.Type))
                     {
-                        AddRun(textBlock, arg.Type, _paramNameBrush);
+                        AddRun(textBlock, arg.Type, _paramNameBrush, _parameterFontScale, _parameterFontFamily);
                         AddRun(textBlock, " ", _punctuationBrush);
                     }
 
                     if (!string.IsNullOrEmpty(arg.Name))
                     {
-                        AddRun(textBlock, arg.Name, _paramNameBrush);
+                        AddRun(textBlock, arg.Name, _paramNameBrush, _parameterFontScale, _parameterFontFamily);
                         if (!string.IsNullOrEmpty(arg.Value))
                         {
                             AddRun(textBlock, "=", _punctuationBrush);
-                            AddRun(textBlock, arg.Value, _paramValueBrush);
+                            AddRun(textBlock, arg.Value, _paramValueBrush, _parameterFontScale, _parameterFontFamily);
                         }
                     }
                     else if (!string.IsNullOrEmpty(arg.Value))
                     {
-                        AddRun(textBlock, arg.Value, _paramValueBrush);
+                        AddRun(textBlock, arg.Value, _paramValueBrush, _parameterFontScale, _parameterFontFamily);
                     }
                 }
                 AddRun(textBlock, ")", _punctuationBrush);
@@ -320,8 +411,8 @@ namespace ColorCallStack
 
             if (TryGetLineNumber(frame, out int line) && line > 0)
             {
-                AddRun(textBlock, " Line ", _punctuationBrush);
-                AddRun(textBlock, line.ToString(), _lineBrush);
+                AddRun(textBlock, " Line ", _punctuationBrush, _lineFontScale, _lineFontFamily);
+                AddRun(textBlock, line.ToString(), _lineBrush, _lineFontScale, _lineFontFamily);
             }
         }
 
@@ -351,7 +442,7 @@ namespace ColorCallStack
                     fileText = file;
                 }
 
-                AddRun(textBlock, fileText, _fileBrush);
+                AddRun(textBlock, fileText, _fileBrush, _fileFontScale, _fileFontFamily);
             }
         }
 
@@ -390,7 +481,13 @@ namespace ColorCallStack
                 TextWrapping = TextWrapping.NoWrap,
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
-            AddRun(text, function, _functionBrush);
+            string fallbackText = function;
+            if (!_showNamespace)
+            {
+                SplitFunctionName(function, out _, out string functionPart);
+                fallbackText = functionPart;
+            }
+            AddRun(text, fallbackText, _functionBrush, _functionFontScale, _functionFontFamily);
             AddInlineLineNumber(text, frame);
             Grid.SetColumn(text, 1);
 
@@ -1215,7 +1312,7 @@ namespace ColorCallStack
             lineColor: Color.FromRgb(170, 75, 0),
             punctuationColor: Color.FromRgb(33, 37, 41));
 
-        private void AddRun(TextBlock textBlock, string text, Brush brush)
+        private void AddRun(TextBlock textBlock, string text, Brush brush, double fontScale = 1.0, FontFamily fontFamily = null)
         {
             if (string.IsNullOrEmpty(text))
             {
@@ -1227,7 +1324,55 @@ namespace ColorCallStack
             {
                 run.Foreground = brush;
             }
+
+            if (fontScale > 0 && Math.Abs(fontScale - 1.0) > 0.001)
+            {
+                run.FontSize = Math.Max(1.0, _fontSize * fontScale);
+            }
+
+            if (fontFamily != null)
+            {
+                run.FontFamily = fontFamily;
+            }
+
             textBlock.Inlines.Add(run);
+        }
+
+        private static double ClampScale(double scale)
+        {
+            if (scale < 0.5)
+            {
+                return 0.5;
+            }
+
+            if (scale > 3.0)
+            {
+                return 3.0;
+            }
+
+            return scale;
+        }
+
+        private static string NormalizeFontFamilyName(string fontFamily)
+        {
+            return string.IsNullOrWhiteSpace(fontFamily) ? null : fontFamily.Trim();
+        }
+
+        private static FontFamily CreateFontFamilyOrNull(string fontFamily)
+        {
+            if (string.IsNullOrWhiteSpace(fontFamily))
+            {
+                return null;
+            }
+
+            try
+            {
+                return new FontFamily(fontFamily);
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static void SplitFunctionName(string functionName, out string namespacePart, out string functionPart)
@@ -1285,6 +1430,20 @@ namespace ColorCallStack
             UpdateContextMenuChecks();
         }
 
+        private void MenuShowNamespace_OnClick(object sender, RoutedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            bool isChecked = MenuShowNamespace?.IsChecked ?? false;
+            if (_showNamespace == isChecked)
+            {
+                return;
+            }
+
+            _showNamespace = isChecked;
+            UpdateCallStackIfAvailable(immediateDetails: true);
+            DisplayOptionsChanged?.Invoke(this, DisplayOptionsChangedEventArgs.ForShowNamespace(isChecked));
+        }
+
         private void MenuShowParameterTypes_OnClick(object sender, RoutedEventArgs e)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -1325,6 +1484,13 @@ namespace ColorCallStack
             _showFilePath = isChecked;
             UpdateCallStackIfAvailable(immediateDetails: true);
             DisplayOptionsChanged?.Invoke(this, DisplayOptionsChangedEventArgs.ForShowFilePath(isChecked));
+        }
+
+        private void MenuResetFactoryDefaults_OnClick(object sender, RoutedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            _skipNextDetailsDelay = true;
+            ResetRequested?.Invoke(this, EventArgs.Empty);
         }
 
         private void MenuFontIncrease_OnClick(object sender, RoutedEventArgs e)
@@ -1448,6 +1614,11 @@ namespace ColorCallStack
         private void UpdateContextMenuChecks()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            if (MenuShowNamespace != null)
+            {
+                MenuShowNamespace.IsChecked = _showNamespace;
+            }
+
             if (MenuShowParameterTypes != null)
             {
                 MenuShowParameterTypes.IsChecked = _showParameterTypes;
@@ -1685,23 +1856,26 @@ namespace ColorCallStack
 
         internal sealed class DisplayOptionsChangedEventArgs : EventArgs
         {
-            private DisplayOptionsChangedEventArgs(bool? showParameterTypes, bool? showLineNumbers, bool? showFilePath, bool? hexDisplayMode)
+            private DisplayOptionsChangedEventArgs(bool? showNamespace, bool? showParameterTypes, bool? showLineNumbers, bool? showFilePath, bool? hexDisplayMode)
             {
+                ShowNamespace = showNamespace;
                 ShowParameterTypes = showParameterTypes;
                 ShowLineNumbers = showLineNumbers;
                 ShowFilePath = showFilePath;
                 HexDisplayMode = hexDisplayMode;
             }
 
+            public bool? ShowNamespace { get; }
             public bool? ShowParameterTypes { get; }
             public bool? ShowLineNumbers { get; }
             public bool? ShowFilePath { get; }
             public bool? HexDisplayMode { get; }
 
-            public static DisplayOptionsChangedEventArgs ForShowParameterTypes(bool value) => new DisplayOptionsChangedEventArgs(value, null, null, null);
-            public static DisplayOptionsChangedEventArgs ForShowLineNumbers(bool value) => new DisplayOptionsChangedEventArgs(null, value, null, null);
-            public static DisplayOptionsChangedEventArgs ForShowFilePath(bool value) => new DisplayOptionsChangedEventArgs(null, null, value, null);
-            public static DisplayOptionsChangedEventArgs ForHexDisplayMode(bool value) => new DisplayOptionsChangedEventArgs(null, null, null, value);
+            public static DisplayOptionsChangedEventArgs ForShowNamespace(bool value) => new DisplayOptionsChangedEventArgs(value, null, null, null, null);
+            public static DisplayOptionsChangedEventArgs ForShowParameterTypes(bool value) => new DisplayOptionsChangedEventArgs(null, value, null, null, null);
+            public static DisplayOptionsChangedEventArgs ForShowLineNumbers(bool value) => new DisplayOptionsChangedEventArgs(null, null, value, null, null);
+            public static DisplayOptionsChangedEventArgs ForShowFilePath(bool value) => new DisplayOptionsChangedEventArgs(null, null, null, value, null);
+            public static DisplayOptionsChangedEventArgs ForHexDisplayMode(bool value) => new DisplayOptionsChangedEventArgs(null, null, null, null, value);
         }
     }
 }

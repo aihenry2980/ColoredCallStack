@@ -40,6 +40,7 @@ namespace ColorCallStack
     [ProvideMenuResource("Menus.ctmenu", 1)]
     [ProvideToolWindow(typeof(ColoredCallStack))]
     [ProvideOptionPage(typeof(ColoredCallStackOptions), "ColorCallStack", "General", 0, 0, true)]
+    [ProvideProfile(typeof(ColoredCallStackOptions), "ColorCallStack", "General", 0, 0, true)]
     [ProvideAutoLoad(UIContextGuids80.Debugging, PackageAutoLoadFlags.BackgroundLoad)]
     public sealed class ColorCallStackPackage : AsyncPackage
     {
@@ -54,6 +55,7 @@ namespace ColorCallStack
         private bool _frameActivatedHooked;
         private bool _displayOptionsHooked;
         private bool _fontSizeHooked;
+        private bool _resetHooked;
         private bool _fontSizeStepsLoaded;
         private int _fontSizeSteps;
         private int _emptyBreakRefreshRetries;
@@ -66,20 +68,6 @@ namespace ColorCallStack
         private const int MinFontSizeSteps = -8;
         private const int MaxFontSizeSteps = 30;
         private static readonly Guid TextEditorFontCategory = new Guid("A27B4E24-A735-4D1D-B8E7-9716E1E3D8E0");
-        private static readonly DrawingColor DefaultLightNamespaceColor = DrawingColor.FromArgb(255, 90, 96, 104);
-        private static readonly DrawingColor DefaultLightFunctionColor = DrawingColor.FromArgb(255, 0, 82, 153);
-        private static readonly DrawingColor DefaultLightParamNameColor = DrawingColor.FromArgb(255, 122, 63, 0);
-        private static readonly DrawingColor DefaultLightParamValueColor = DrawingColor.FromArgb(255, 0, 100, 0);
-        private static readonly DrawingColor DefaultLightFileColor = DrawingColor.FromArgb(255, 28, 98, 139);
-        private static readonly DrawingColor DefaultLightLineColor = DrawingColor.FromArgb(255, 170, 75, 0);
-        private static readonly DrawingColor DefaultLightPunctuationColor = DrawingColor.FromArgb(255, 33, 37, 41);
-        private static readonly DrawingColor DefaultDarkNamespaceColor = DrawingColor.FromArgb(255, 156, 163, 175);
-        private static readonly DrawingColor DefaultDarkFunctionColor = DrawingColor.FromArgb(255, 86, 156, 214);
-        private static readonly DrawingColor DefaultDarkParamNameColor = DrawingColor.FromArgb(255, 206, 145, 120);
-        private static readonly DrawingColor DefaultDarkParamValueColor = DrawingColor.FromArgb(255, 181, 206, 168);
-        private static readonly DrawingColor DefaultDarkFileColor = DrawingColor.FromArgb(255, 156, 220, 254);
-        private static readonly DrawingColor DefaultDarkLineColor = DrawingColor.FromArgb(255, 255, 198, 109);
-        private static readonly DrawingColor DefaultDarkPunctuationColor = DrawingColor.FromArgb(255, 208, 208, 208);
 
         #region Package Members
 
@@ -335,6 +323,11 @@ namespace ColorCallStack
                     _callStackControl.FontSizeStepRequested += Control_FontSizeStepRequested;
                     _fontSizeHooked = true;
                 }
+                if (!_resetHooked)
+                {
+                    _callStackControl.ResetRequested += Control_ResetRequested;
+                    _resetHooked = true;
+                }
 
                 return _callStackControl;
             }
@@ -356,6 +349,7 @@ namespace ColorCallStack
                 ApplyPalette(control);
                 ApplyDisplayOptions(control);
                 ApplyThemeMode(control);
+                ApplyTextEditorFont(control);
                 RefreshCallStack(onlyIfVisible: false);
             }).FileAndForget("ColorCallStack/ApplyOptions");
         }
@@ -382,12 +376,13 @@ namespace ColorCallStack
             }
 
             var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
+            bool showNamespace = options?.ShowNamespace ?? true;
             bool showParameterTypes = options?.ShowParameterTypes ?? false;
             bool showLineNumbers = options?.ShowLineNumbers ?? true;
             bool showFilePath = options?.ShowFilePath ?? true;
             bool hexDisplayMode = _dte?.Debugger != null && _dte.Debugger.HexDisplayMode;
 
-            control.SetDisplayOptions(showParameterTypes, showLineNumbers, showFilePath, hexDisplayMode);
+            control.SetDisplayOptions(showNamespace, showParameterTypes, showLineNumbers, showFilePath, hexDisplayMode);
         }
 
         private void Control_DisplayOptionsChanged(object sender, ColoredCallStackControl.DisplayOptionsChangedEventArgs e)
@@ -416,6 +411,12 @@ namespace ColorCallStack
             }
 
             bool refreshNeeded = false;
+            if (e.ShowNamespace.HasValue)
+            {
+                options.ShowNamespace = e.ShowNamespace.Value;
+                refreshNeeded = true;
+            }
+
             if (e.ShowParameterTypes.HasValue)
             {
                 options.ShowParameterTypes = e.ShowParameterTypes.Value;
@@ -489,6 +490,48 @@ namespace ColorCallStack
             }
         }
 
+        private void Control_ResetRequested(object sender, EventArgs e)
+        {
+            if (!ThreadHelper.CheckAccess())
+            {
+                JoinableTaskFactory.RunAsync(async () =>
+                {
+                    await JoinableTaskFactory.SwitchToMainThreadAsync();
+                    Control_ResetRequestedCore();
+                }).FileAndForget("ColorCallStack/ResetRequested");
+                return;
+            }
+
+            Control_ResetRequestedCore();
+        }
+
+        private void Control_ResetRequestedCore()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
+            if (options == null)
+            {
+                return;
+            }
+
+            options.ResetToFactoryDefaults();
+            options.SaveSettingsToStorage();
+            _fontSizeStepsLoaded = false;
+
+            var control = GetToolWindowControl(create: false);
+            if (control != null)
+            {
+                ApplyPalette(control);
+                ApplyDisplayOptions(control);
+                ApplyThemeMode(control);
+                ApplyTextEditorFont(control);
+            }
+
+            CancelPendingRefresh();
+            RefreshCallStack(onlyIfVisible: false);
+        }
+
         private void ApplyPalette(ColoredCallStackControl control)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -504,22 +547,22 @@ namespace ColorCallStack
             }
 
             var light = new ColoredCallStackControl.Palette(
-                ToMediaColor(NormalizeColor(options.LightNamespaceColor, DefaultLightNamespaceColor)),
-                ToMediaColor(NormalizeColor(options.LightFunctionColor, DefaultLightFunctionColor)),
-                ToMediaColor(NormalizeColor(options.LightParamNameColor, DefaultLightParamNameColor)),
-                ToMediaColor(NormalizeColor(options.LightParamValueColor, DefaultLightParamValueColor)),
-                ToMediaColor(NormalizeColor(options.LightFileColor, DefaultLightFileColor)),
-                ToMediaColor(NormalizeColor(options.LightLineColor, DefaultLightLineColor)),
-                ToMediaColor(NormalizeColor(options.LightPunctuationColor, DefaultLightPunctuationColor)));
+                ToMediaColor(NormalizeColor(options.LightNamespaceColor, ColoredCallStackDefaultColors.LightNamespace)),
+                ToMediaColor(NormalizeColor(options.LightFunctionColor, ColoredCallStackDefaultColors.LightFunction)),
+                ToMediaColor(NormalizeColor(options.LightParamNameColor, ColoredCallStackDefaultColors.LightParamName)),
+                ToMediaColor(NormalizeColor(options.LightParamValueColor, ColoredCallStackDefaultColors.LightParamValue)),
+                ToMediaColor(NormalizeColor(options.LightFileColor, ColoredCallStackDefaultColors.LightFile)),
+                ToMediaColor(NormalizeColor(options.LightLineColor, ColoredCallStackDefaultColors.LightLine)),
+                ToMediaColor(NormalizeColor(options.LightPunctuationColor, ColoredCallStackDefaultColors.LightPunctuation)));
 
             var dark = new ColoredCallStackControl.Palette(
-                ToMediaColor(NormalizeColor(options.DarkNamespaceColor, DefaultDarkNamespaceColor)),
-                ToMediaColor(NormalizeColor(options.DarkFunctionColor, DefaultDarkFunctionColor)),
-                ToMediaColor(NormalizeColor(options.DarkParamNameColor, DefaultDarkParamNameColor)),
-                ToMediaColor(NormalizeColor(options.DarkParamValueColor, DefaultDarkParamValueColor)),
-                ToMediaColor(NormalizeColor(options.DarkFileColor, DefaultDarkFileColor)),
-                ToMediaColor(NormalizeColor(options.DarkLineColor, DefaultDarkLineColor)),
-                ToMediaColor(NormalizeColor(options.DarkPunctuationColor, DefaultDarkPunctuationColor)));
+                ToMediaColor(NormalizeColor(options.DarkNamespaceColor, ColoredCallStackDefaultColors.DarkNamespace)),
+                ToMediaColor(NormalizeColor(options.DarkFunctionColor, ColoredCallStackDefaultColors.DarkFunction)),
+                ToMediaColor(NormalizeColor(options.DarkParamNameColor, ColoredCallStackDefaultColors.DarkParamName)),
+                ToMediaColor(NormalizeColor(options.DarkParamValueColor, ColoredCallStackDefaultColors.DarkParamValue)),
+                ToMediaColor(NormalizeColor(options.DarkFileColor, ColoredCallStackDefaultColors.DarkFile)),
+                ToMediaColor(NormalizeColor(options.DarkLineColor, ColoredCallStackDefaultColors.DarkLine)),
+                ToMediaColor(NormalizeColor(options.DarkPunctuationColor, ColoredCallStackDefaultColors.DarkPunctuation)));
 
             control.SetPalettes(light, dark);
         }
@@ -533,11 +576,27 @@ namespace ColorCallStack
             }
 
             EnsureFontSizeStepsLoaded();
-            if (TryGetTextEditorFont(out string family, out double size))
-            {
-                double adjustedSize = Math.Max(1.0, size + (_fontSizeSteps * FontStepDip));
-                control.SetFont(family, adjustedSize);
-            }
+            string family = "Consolas";
+            double size = 12.0;
+            TryGetTextEditorFont(out family, out size);
+
+            double adjustedSize = Math.Max(1.0, size + (_fontSizeSteps * FontStepDip));
+            control.SetFont(family, adjustedSize);
+
+            var options = GetDialogPage(typeof(ColoredCallStackOptions)) as ColoredCallStackOptions;
+            double namespaceScale = PercentToScale(options?.NamespaceFontSizePercent ?? 100);
+            double functionScale = PercentToScale(options?.FunctionFontSizePercent ?? 100);
+            double parameterScale = PercentToScale(options?.ParameterFontSizePercent ?? 100);
+            double lineScale = PercentToScale(options?.LineFontSizePercent ?? 100);
+            double fileScale = PercentToScale(options?.FileFontSizePercent ?? 100);
+
+            control.SetTokenFontScales(namespaceScale, functionScale, parameterScale, lineScale, fileScale);
+            control.SetTokenFontFamilies(
+                options?.NamespaceFontFace,
+                options?.FunctionFontFace,
+                options?.ParameterFontFace,
+                options?.LineFontFace,
+                options?.FileFontFace);
         }
 
         private void EnsureFontSizeStepsLoaded()
@@ -589,6 +648,12 @@ namespace ColorCallStack
             }
 
             return value;
+        }
+
+        private static double PercentToScale(int percent)
+        {
+            int clamped = ClampInt(percent, 50, 300);
+            return clamped / 100.0;
         }
 
         private bool TryGetTextEditorFont(out string fontFamily, out double fontSize)
@@ -1076,3 +1141,4 @@ namespace ColorCallStack
         #endregion
     }
 }
+

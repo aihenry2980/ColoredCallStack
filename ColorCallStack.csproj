@@ -46,7 +46,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="ColoredCallStack.cs" />
+    <Compile Include="ColoredCallStackDefaultColors.cs" />
     <Compile Include="ColoredCallStackCommand.cs" />
+    <Compile Include="FontFaceEditor.cs" />
     <Compile Include="ColoredCallStackControl.xaml.cs">
       <DependentUpon>ColoredCallStackControl.xaml</DependentUpon>
     </Compile>
