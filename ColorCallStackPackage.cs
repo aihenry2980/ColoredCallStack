@@ -61,13 +61,16 @@ namespace ColorCallStack
         private int _emptyBreakRefreshRetries;
         private CancellationTokenSource _refreshCts;
         private const int ContextRefreshDebounceMs = 120;
-        private const int BreakRefreshDebounceMs = 250;
+        private const int ContextRefreshMinGapMs = 250;
+        private const int BreakFollowupRefreshMs = 90;
+        private const int BreakGuaranteedRefreshMs = 260;
         private const int RetryRefreshDebounceMs = 60;
         private const int MaxEmptyBreakRefreshRetries = 40;
         private const double FontStepDip = 1.0;
         private const int MinFontSizeSteps = -8;
         private const int MaxFontSizeSteps = 30;
         private static readonly Guid TextEditorFontCategory = new Guid("A27B4E24-A735-4D1D-B8E7-9716E1E3D8E0");
+        private DateTime _lastRenderedAtUtc = DateTime.MinValue;
 
         #region Package Members
 
@@ -108,12 +111,27 @@ namespace ColorCallStack
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             _emptyBreakRefreshRetries = 0;
-            QueueRefreshCallStack(onlyIfVisible: false, delayMs: BreakRefreshDebounceMs);
+            CancelPendingRefresh();
+            bool rendered = RefreshCallStackAndReport(onlyIfVisible: false);
+            if (!rendered)
+            {
+                ScheduleBreakWarmupRefreshes();
+            }
         }
 
         private void DebuggerEvents_OnContextChanged(EnvDTE.Process NewProcess, EnvDTE.Program NewProgram, EnvDTE.Thread NewThread, EnvDTE.StackFrame NewStackFrame)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            if (_dte?.Debugger?.CurrentMode != dbgDebugMode.dbgBreakMode)
+            {
+                return;
+            }
+
+            if ((DateTime.UtcNow - _lastRenderedAtUtc).TotalMilliseconds < ContextRefreshMinGapMs)
+            {
+                return;
+            }
+
             QueueRefreshCallStack(onlyIfVisible: true, delayMs: ContextRefreshDebounceMs);
         }
 
@@ -122,6 +140,7 @@ namespace ColorCallStack
             ThreadHelper.ThrowIfNotOnUIThread();
             CancelPendingRefresh();
             _emptyBreakRefreshRetries = 0;
+            _lastRenderedAtUtc = DateTime.MinValue;
             // Keep last rendered frames while stepping to avoid UI churn on every F10.
         }
 
@@ -130,6 +149,7 @@ namespace ColorCallStack
             ThreadHelper.ThrowIfNotOnUIThread();
             CancelPendingRefresh();
             _emptyBreakRefreshRetries = 0;
+            _lastRenderedAtUtc = DateTime.MinValue;
             ClearCallStack();
         }
 
@@ -200,46 +220,97 @@ namespace ColorCallStack
             }
         }
 
+        private void ScheduleBreakWarmupRefreshes()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            JoinableTaskFactory.RunAsync(async () =>
+            {
+                await Task.Delay(BreakFollowupRefreshMs);
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+                if (_dte?.Debugger?.CurrentMode == dbgDebugMode.dbgBreakMode)
+                {
+                    if (RefreshCallStackAndReport(onlyIfVisible: false))
+                    {
+                        return;
+                    }
+                }
+
+                await Task.Delay(BreakGuaranteedRefreshMs);
+                await JoinableTaskFactory.SwitchToMainThreadAsync();
+                if (_dte?.Debugger?.CurrentMode == dbgDebugMode.dbgBreakMode)
+                {
+                    RefreshCallStack(onlyIfVisible: false);
+                }
+            }).FileAndForget("ColorCallStack/BreakWarmupRefreshes");
+        }
+
         private void RefreshCallStack(bool onlyIfVisible)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            RefreshCallStackAndReport(onlyIfVisible);
+        }
+
+        private bool RefreshCallStackAndReport(bool onlyIfVisible)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
             var control = GetToolWindowControl(create: false);
+            if (control == null && _dte?.Debugger?.CurrentMode == dbgDebugMode.dbgBreakMode && IsToolWindowVisible())
+            {
+                control = GetToolWindowControl(create: true);
+            }
+
             if (control == null || _dte?.Debugger == null)
             {
                 if (_dte?.Debugger?.CurrentMode == dbgDebugMode.dbgBreakMode &&
+                    IsToolWindowVisible() &&
                     _emptyBreakRefreshRetries < MaxEmptyBreakRefreshRetries)
                 {
                     _emptyBreakRefreshRetries++;
                     QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
                 }
 
-                return;
+                return false;
             }
 
             if (onlyIfVisible && !IsToolWindowVisible())
             {
-                return;
+                return false;
             }
 
-            ApplyPalette(control);
             ApplyDisplayOptions(control);
-            ApplyThemeMode(control);
-            ApplyTextEditorFont(control);
+
+            StackFrame currentFrame = null;
+            try
+            {
+                currentFrame = _dte.Debugger.CurrentStackFrame;
+            }
+            catch
+            {
+                currentFrame = null;
+            }
 
             EnvDTE.Thread thread = _dte.Debugger.CurrentThread;
             if (thread == null)
             {
+                if (currentFrame != null)
+                {
+                    _emptyBreakRefreshRetries = 0;
+                    control.UpdateCallStack(new List<StackFrame> { currentFrame }, currentFrame);
+                    _lastRenderedAtUtc = DateTime.UtcNow;
+                    return true;
+                }
+
                 if (_dte.Debugger.CurrentMode == dbgDebugMode.dbgBreakMode &&
                     _emptyBreakRefreshRetries < MaxEmptyBreakRefreshRetries)
                 {
                     _emptyBreakRefreshRetries++;
                     QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
-                    return;
+                    return false;
                 }
 
                 _emptyBreakRefreshRetries = 0;
                 control.ClearCallStack();
-                return;
+                return false;
             }
 
             var frames = new List<StackFrame>();
@@ -257,12 +328,17 @@ namespace ColorCallStack
                 {
                     _emptyBreakRefreshRetries++;
                     QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
-                    return;
+                    return false;
                 }
 
                 _emptyBreakRefreshRetries = 0;
                 control.ClearCallStack();
-                return;
+                return false;
+            }
+
+            if (frames.Count == 0 && currentFrame != null)
+            {
+                frames.Add(currentFrame);
             }
 
             if (frames.Count == 0 && _dte.Debugger.CurrentMode == dbgDebugMode.dbgBreakMode)
@@ -271,12 +347,14 @@ namespace ColorCallStack
                 {
                     _emptyBreakRefreshRetries++;
                     QueueRefreshCallStack(onlyIfVisible: false, delayMs: RetryRefreshDebounceMs);
-                    return;
+                    return false;
                 }
             }
 
             _emptyBreakRefreshRetries = 0;
-            control.UpdateCallStack(frames, _dte.Debugger.CurrentStackFrame);
+            control.UpdateCallStack(frames, currentFrame);
+            _lastRenderedAtUtc = DateTime.UtcNow;
+            return frames.Count > 0;
         }
 
         private bool IsToolWindowVisible()
@@ -304,10 +382,16 @@ namespace ColorCallStack
             ToolWindowPane window = FindToolWindow(typeof(ColoredCallStack), 0, create);
             if (window?.Content is ColoredCallStackControl control)
             {
-                if (_callStackControl == null)
+                bool newControl = !ReferenceEquals(_callStackControl, control);
+                if (newControl)
                 {
                     _callStackControl = control;
+                    _frameActivatedHooked = false;
+                    _displayOptionsHooked = false;
+                    _fontSizeHooked = false;
+                    _resetHooked = false;
                 }
+
                 if (!_frameActivatedHooked)
                 {
                     _callStackControl.FrameActivated += Control_FrameActivated;
@@ -327,6 +411,14 @@ namespace ColorCallStack
                 {
                     _callStackControl.ResetRequested += Control_ResetRequested;
                     _resetHooked = true;
+                }
+
+                if (newControl)
+                {
+                    ApplyPalette(_callStackControl);
+                    ApplyDisplayOptions(_callStackControl);
+                    ApplyThemeMode(_callStackControl);
+                    ApplyTextEditorFont(_callStackControl);
                 }
 
                 return _callStackControl;

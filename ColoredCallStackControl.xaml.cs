@@ -15,6 +15,7 @@ using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using System.Text.RegularExpressions;
 
 namespace ColorCallStack
@@ -32,6 +33,7 @@ namespace ColorCallStack
         private Brush _fileBrush;
         private Brush _lineBrush;
         private Brush _punctuationBrush;
+        private Brush[] _namespaceGroupBrushes = new[] { Brushes.Transparent };
         private FontFamily _fontFamily = new FontFamily("Consolas");
         private double _fontSize = 12.0;
         private Palette _lightPalette = LightPalette;
@@ -62,6 +64,12 @@ namespace ColorCallStack
         private StackFrame _lastCurrentFrame;
         private CallStackThemeMode _themeMode = CallStackThemeMode.Auto;
         private bool _skipNextDetailsDelay;
+        private string _searchText = string.Empty;
+        private Brush _searchMatchBrush = Brushes.Transparent;
+        private readonly DispatcherTimer _searchRefreshTimer;
+        private string _pendingSearchText = string.Empty;
+        private readonly Dictionary<string, SourceInfoCacheEntry> _sourceInfoCache = new Dictionary<string, SourceInfoCacheEntry>(StringComparer.Ordinal);
+        private const int MaxSourceInfoCacheEntries = 1024;
 
         internal event EventHandler<StackFrame> FrameActivated;
         internal event EventHandler<DisplayOptionsChangedEventArgs> DisplayOptionsChanged;
@@ -75,6 +83,11 @@ namespace ColorCallStack
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             InitializeComponent();
+            _searchRefreshTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromMilliseconds(180)
+            };
+            _searchRefreshTimer.Tick += SearchRefreshTimer_OnTick;
             UpdateThemeResources();
             Loaded += OnLoaded;
             Unloaded += OnUnloaded;
@@ -99,6 +112,11 @@ namespace ColorCallStack
         internal void SetPalettes(Palette lightPalette, Palette darkPalette)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            if (lightPalette.Equals(_lightPalette) && darkPalette.Equals(_darkPalette))
+            {
+                return;
+            }
+
             _lightPalette = lightPalette;
             _darkPalette = darkPalette;
             UpdateThemeResources();
@@ -205,22 +223,34 @@ namespace ColorCallStack
         internal void SetFont(string fontFamilyName, double fontSize)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            FontFamily nextFontFamily = _fontFamily;
             if (!string.IsNullOrWhiteSpace(fontFamilyName))
             {
                 try
                 {
-                    _fontFamily = new FontFamily(fontFamilyName);
+                    nextFontFamily = new FontFamily(fontFamilyName);
                 }
                 catch
                 {
-                    _fontFamily = new FontFamily("Consolas");
+                    nextFontFamily = new FontFamily("Consolas");
                 }
             }
 
+            double nextFontSize = _fontSize;
             if (fontSize > 0)
             {
-                _fontSize = fontSize;
+                nextFontSize = fontSize;
             }
+
+            bool familyChanged = !string.Equals(_fontFamily?.Source, nextFontFamily?.Source, StringComparison.OrdinalIgnoreCase);
+            bool sizeChanged = Math.Abs(_fontSize - nextFontSize) > 0.001;
+            if (!familyChanged && !sizeChanged)
+            {
+                return;
+            }
+
+            _fontFamily = nextFontFamily;
+            _fontSize = nextFontSize;
 
             if (_lastFrames != null)
             {
@@ -248,17 +278,26 @@ namespace ColorCallStack
             }
 
             ListBoxItem currentItem = null;
+            string previousNamespaceKey = null;
+            int namespaceGroupIndex = 0;
             foreach (var frame in frames)
             {
+                string currentNamespaceKey = GetNamespaceKey(frame);
+                if (previousNamespaceKey != null && !string.Equals(previousNamespaceKey, currentNamespaceKey, StringComparison.Ordinal))
+                {
+                    namespaceGroupIndex = GetNextNamespaceGroupIndex(namespaceGroupIndex);
+                }
+
+                previousNamespaceKey = currentNamespaceKey;
                 bool isCurrent = IsSameFrame(frame, currentFrame);
                 ListBoxItem item;
                 try
                 {
-                    item = CreateFrameItem(frame, isCurrent);
+                    item = CreateFrameItem(frame, isCurrent, namespaceGroupIndex);
                 }
                 catch
                 {
-                    item = CreateFallbackItem(frame, isCurrent);
+                    item = CreateFallbackItem(frame, isCurrent, namespaceGroupIndex);
                 }
                 FramesList.Items.Add(item);
                 if (isCurrent)
@@ -276,12 +315,12 @@ namespace ColorCallStack
             BeginPopulateDetails();
         }
 
-        private ListBoxItem CreateFrameItem(StackFrame frame, bool isCurrent)
+        private ListBoxItem CreateFrameItem(StackFrame frame, bool isCurrent, int namespaceGroupIndex)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             var border = new Border
             {
-                Background = isCurrent ? _currentFrameBrush : Brushes.Transparent,
+                Background = ResolveRowBackground(isCurrent, isSelected: false, namespaceGroupIndex),
                 Padding = new Thickness(2, 1, 2, 1)
             };
 
@@ -310,7 +349,6 @@ namespace ColorCallStack
                 TextWrapping = TextWrapping.NoWrap,
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
-            BuildFrameInlines(text, frame, includeArguments: false);
             Grid.SetColumn(text, 1);
 
             var fileText = new TextBlock
@@ -322,8 +360,14 @@ namespace ColorCallStack
                 Margin = new Thickness(12, 0, 6, 0),
                 HorizontalAlignment = HorizontalAlignment.Right
             };
-            BuildFileInlines(fileText, frame, includeFileInfo: true);
             Grid.SetColumn(fileText, 2);
+
+            string function = GetSafeFunctionName(frame);
+            SplitFunctionName(function, out string namespacePart, out string functionPart);
+            var rowInfo = new FrameRowInfo(frame, border, text, fileText, isCurrent, namespaceGroupIndex, namespacePart, functionPart, function);
+            // Keep first paint lightweight during stepping; details are filled asynchronously.
+            BuildFrameInlines(text, rowInfo, includeArguments: false, includeLineNumbers: isCurrent);
+            BuildFileInlines(fileText, rowInfo, includeFileInfo: false);
 
             grid.Children.Add(arrow);
             grid.Children.Add(text);
@@ -333,13 +377,13 @@ namespace ColorCallStack
             var item = new ListBoxItem
             {
                 Content = border,
-                Tag = new FrameRowInfo(frame, border, text, fileText, isCurrent)
+                Tag = rowInfo
             };
 
             return item;
         }
 
-        private void BuildFrameInlines(TextBlock textBlock, StackFrame frame, bool includeArguments)
+        private void BuildFrameInlines(TextBlock textBlock, FrameRowInfo rowInfo, bool includeArguments, bool includeLineNumbers)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             if (textBlock == null)
@@ -347,23 +391,20 @@ namespace ColorCallStack
                 return;
             }
 
-            if (frame == null)
+            if (rowInfo == null)
             {
                 AddRun(textBlock, "<unknown>", _functionBrush);
                 return;
             }
 
-            string function = GetSafeFunctionName(frame);
-            SplitFunctionName(function, out string namespacePart, out string functionPart);
-
-            if (_showNamespace && !string.IsNullOrEmpty(namespacePart))
+            if (_showNamespace && !string.IsNullOrEmpty(rowInfo.NamespacePart))
             {
-                AddRun(textBlock, namespacePart, _namespaceBrush, _namespaceFontScale, _namespaceFontFamily);
+                AddRun(textBlock, rowInfo.NamespacePart, _namespaceBrush, _namespaceFontScale, _namespaceFontFamily);
             }
 
-            AddRun(textBlock, functionPart, _functionBrush, _functionFontScale, _functionFontFamily);
+            AddRun(textBlock, rowInfo.FunctionPart, _functionBrush, _functionFontScale, _functionFontFamily);
 
-            if (includeArguments && TryGetArguments(frame.Arguments, out List<ArgumentPart> args) && args.Count > 0)
+            if (includeArguments && TryGetArguments(rowInfo, out List<ArgumentPart> args) && args.Count > 0)
             {
                 AddRun(textBlock, "(", _punctuationBrush);
                 for (int i = 0; i < args.Count; i++)
@@ -397,62 +438,56 @@ namespace ColorCallStack
                 AddRun(textBlock, ")", _punctuationBrush);
             }
 
-            AddInlineLineNumber(textBlock, frame);
+            if (includeLineNumbers)
+            {
+                AddInlineLineNumber(textBlock, rowInfo);
+            }
 
         }
 
-        private void AddInlineLineNumber(TextBlock textBlock, StackFrame frame)
+        private void AddInlineLineNumber(TextBlock textBlock, FrameRowInfo rowInfo)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            if (!_showLineNumbers || textBlock == null || frame == null)
+            if (!_showLineNumbers || textBlock == null || rowInfo == null)
             {
                 return;
             }
 
-            if (TryGetLineNumber(frame, out int line) && line > 0)
+            EnsureSourceInfoLoaded(rowInfo);
+            if (rowInfo.LineNumber > 0)
             {
                 AddRun(textBlock, " Line ", _punctuationBrush, _lineFontScale, _lineFontFamily);
-                AddRun(textBlock, line.ToString(), _lineBrush, _lineFontScale, _lineFontFamily);
+                AddRun(textBlock, rowInfo.LineNumber.ToString(), _lineBrush, _lineFontScale, _lineFontFamily);
             }
         }
 
-        private void BuildFileInlines(TextBlock textBlock, StackFrame frame, bool includeFileInfo)
+        private void BuildFileInlines(TextBlock textBlock, FrameRowInfo rowInfo, bool includeFileInfo)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
-            if (textBlock == null)
+            if (textBlock == null || rowInfo == null)
             {
                 return;
             }
 
-            if (!includeFileInfo)
+            if (!includeFileInfo || !_showFilePath)
             {
                 return;
             }
 
-            if (TryGetFileInfo(frame, out string file, out int _))
+            EnsureSourceInfoLoaded(rowInfo);
+            if (!string.IsNullOrEmpty(rowInfo.FileName))
             {
-                if (!_showFilePath)
-                {
-                    return;
-                }
-
-                string fileText = System.IO.Path.GetFileName(file);
-                if (string.IsNullOrEmpty(fileText))
-                {
-                    fileText = file;
-                }
-
-                AddRun(textBlock, fileText, _fileBrush, _fileFontScale, _fileFontFamily);
+                AddRun(textBlock, rowInfo.FileName, _fileBrush, _fileFontScale, _fileFontFamily);
             }
         }
 
-        private ListBoxItem CreateFallbackItem(StackFrame frame, bool isCurrent)
+        private ListBoxItem CreateFallbackItem(StackFrame frame, bool isCurrent, int namespaceGroupIndex)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             string function = GetSafeFunctionName(frame);
             var border = new Border
             {
-                Background = isCurrent ? _currentFrameBrush : Brushes.Transparent,
+                Background = ResolveRowBackground(isCurrent, isSelected: false, namespaceGroupIndex),
                 Padding = new Thickness(2, 1, 2, 1)
             };
 
@@ -481,14 +516,6 @@ namespace ColorCallStack
                 TextWrapping = TextWrapping.NoWrap,
                 TextTrimming = TextTrimming.CharacterEllipsis
             };
-            string fallbackText = function;
-            if (!_showNamespace)
-            {
-                SplitFunctionName(function, out _, out string functionPart);
-                fallbackText = functionPart;
-            }
-            AddRun(text, fallbackText, _functionBrush, _functionFontScale, _functionFontFamily);
-            AddInlineLineNumber(text, frame);
             Grid.SetColumn(text, 1);
 
             var fileText = new TextBlock
@@ -500,8 +527,12 @@ namespace ColorCallStack
                 Margin = new Thickness(12, 0, 6, 0),
                 HorizontalAlignment = HorizontalAlignment.Right
             };
-            BuildFileInlines(fileText, frame, includeFileInfo: true);
             Grid.SetColumn(fileText, 2);
+
+            SplitFunctionName(function, out string namespacePart, out string functionPart);
+            var rowInfo = new FrameRowInfo(frame, border, text, fileText, isCurrent, namespaceGroupIndex, namespacePart, functionPart, function);
+            BuildFrameInlines(text, rowInfo, includeArguments: false, includeLineNumbers: isCurrent);
+            BuildFileInlines(fileText, rowInfo, includeFileInfo: false);
 
             grid.Children.Add(arrow);
             grid.Children.Add(text);
@@ -511,8 +542,27 @@ namespace ColorCallStack
             return new ListBoxItem
             {
                 Content = border,
-                Tag = new FrameRowInfo(frame, border, text, fileText, isCurrent)
+                Tag = rowInfo
             };
+        }
+
+        private static string GetNamespaceKey(StackFrame frame)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            string function = GetSafeFunctionName(frame);
+            SplitFunctionName(function, out string namespacePart, out _);
+            return namespacePart ?? string.Empty;
+        }
+
+        private int GetNextNamespaceGroupIndex(int currentIndex)
+        {
+            int count = _namespaceGroupBrushes?.Length ?? 0;
+            if (count <= 1)
+            {
+                return 0;
+            }
+
+            return (currentIndex + 1) % count;
         }
 
         private static string GetSafeFunctionName(StackFrame frame)
@@ -617,6 +667,81 @@ namespace ColorCallStack
             {
                 arguments = null;
                 return false;
+            }
+        }
+
+        private static bool TryGetArguments(FrameRowInfo rowInfo, out List<ArgumentPart> arguments)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            arguments = null;
+            if (rowInfo == null)
+            {
+                return false;
+            }
+
+            if (rowInfo.ArgumentsComputed)
+            {
+                arguments = rowInfo.Arguments;
+                return arguments != null && arguments.Count > 0;
+            }
+
+            List<ArgumentPart> parsedArguments = null;
+            if (rowInfo.Frame != null)
+            {
+                try
+                {
+                    TryGetArguments(rowInfo.Frame.Arguments, out parsedArguments);
+                }
+                catch
+                {
+                    parsedArguments = null;
+                }
+            }
+
+            rowInfo.SetArguments(parsedArguments);
+            arguments = rowInfo.Arguments;
+            return arguments != null && arguments.Count > 0;
+        }
+
+        private void EnsureSourceInfoLoaded(FrameRowInfo rowInfo)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (rowInfo == null || rowInfo.SourceInfoComputed)
+            {
+                return;
+            }
+
+            bool allowCache = !rowInfo.IsCurrent && !string.IsNullOrEmpty(rowInfo.FrameCacheKey);
+            if (allowCache && _sourceInfoCache.TryGetValue(rowInfo.FrameCacheKey, out SourceInfoCacheEntry cached))
+            {
+                rowInfo.SetSourceInfo(cached.FileName, cached.LineNumber);
+                return;
+            }
+
+            string file = null;
+            int line = 0;
+            if (rowInfo.Frame != null)
+            {
+                if (!TryGetFileInfo(rowInfo.Frame, out file, out line))
+                {
+                    file = null;
+                }
+
+                if (line <= 0 && TryGetLineNumber(rowInfo.Frame, out int resolvedLine))
+                {
+                    line = resolvedLine;
+                }
+            }
+
+            rowInfo.SetSourceInfo(file, line);
+            if (allowCache && (!string.IsNullOrEmpty(rowInfo.FileName) || rowInfo.LineNumber > 0))
+            {
+                if (_sourceInfoCache.Count >= MaxSourceInfoCacheEntries && !_sourceInfoCache.ContainsKey(rowInfo.FrameCacheKey))
+                {
+                    _sourceInfoCache.Clear();
+                }
+
+                _sourceInfoCache[rowInfo.FrameCacheKey] = new SourceInfoCacheEntry(rowInfo.FileName, rowInfo.LineNumber);
             }
         }
 
@@ -1277,8 +1402,65 @@ namespace ColorCallStack
         private void UpdateThemeResources()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            bool isDarkTheme = IsDarkTheme();
             _currentFrameBrush = (Brush)Application.Current.TryFindResource(SystemColors.ControlLightBrushKey) ?? Brushes.Transparent;
+            _namespaceGroupBrushes = CreateNamespaceBandBrushes(isDarkTheme);
+            _searchMatchBrush = CreateSearchMatchBrush(isDarkTheme);
             InitializePalette(out _namespaceBrush, out _functionBrush, out _paramNameBrush, out _paramValueBrush, out _fileBrush, out _lineBrush, out _punctuationBrush);
+        }
+
+        private bool IsDarkTheme()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            var background = Application.Current.TryFindResource(VsBrushes.WindowKey) as SolidColorBrush ?? SystemColors.WindowBrush;
+            bool isDark = IsDarkColor(background.Color);
+            if (_themeMode == CallStackThemeMode.Light)
+            {
+                return false;
+            }
+
+            if (_themeMode == CallStackThemeMode.Dark)
+            {
+                return true;
+            }
+
+            return isDark;
+        }
+
+        private static Brush[] CreateNamespaceBandBrushes(bool isDarkTheme)
+        {
+            if (isDarkTheme)
+            {
+                return new[]
+                {
+                    CreateBrush(Color.FromArgb(28, 66, 92, 128)),
+                    CreateBrush(Color.FromArgb(28, 88, 72, 122)),
+                    CreateBrush(Color.FromArgb(28, 96, 84, 64)),
+                    CreateBrush(Color.FromArgb(28, 76, 104, 96)),
+                    CreateBrush(Color.FromArgb(28, 98, 76, 84)),
+                    CreateBrush(Color.FromArgb(28, 84, 84, 116))
+                };
+            }
+
+            return new[]
+            {
+                CreateBrush(Color.FromRgb(253, 242, 242)),
+                CreateBrush(Color.FromRgb(241, 247, 255)),
+                CreateBrush(Color.FromRgb(241, 251, 243)),
+                CreateBrush(Color.FromRgb(255, 248, 237)),
+                CreateBrush(Color.FromRgb(246, 242, 255)),
+                CreateBrush(Color.FromRgb(240, 250, 250))
+            };
+        }
+
+        private static Brush CreateSearchMatchBrush(bool isDarkTheme)
+        {
+            if (isDarkTheme)
+            {
+                return CreateBrush(Color.FromArgb(160, 255, 225, 120));
+            }
+
+            return CreateBrush(Color.FromRgb(255, 245, 170));
         }
 
         private static bool IsDarkColor(Color color)
@@ -1319,10 +1501,67 @@ namespace ColorCallStack
                 return;
             }
 
+            string search = _searchText;
+            if (string.IsNullOrWhiteSpace(search))
+            {
+                AddStyledRun(textBlock, text, brush, fontScale, fontFamily, highlight: false);
+                return;
+            }
+
+            int searchLength = search.Length;
+            int start = 0;
+            while (start < text.Length)
+            {
+                int matchIndex = text.IndexOf(search, start, StringComparison.OrdinalIgnoreCase);
+                if (matchIndex < 0)
+                {
+                    AddStyledRun(textBlock, text.Substring(start), brush, fontScale, fontFamily, highlight: false);
+                    break;
+                }
+
+                if (matchIndex > start)
+                {
+                    AddStyledRun(textBlock, text.Substring(start, matchIndex - start), brush, fontScale, fontFamily, highlight: false);
+                }
+
+                AddStyledRun(textBlock, text.Substring(matchIndex, searchLength), brush, fontScale, fontFamily, highlight: true);
+                start = matchIndex + searchLength;
+            }
+        }
+
+        internal bool TryHandleShortcut(Key key, ModifierKeys modifiers)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if ((modifiers & ModifierKeys.Control) == 0)
+            {
+                return false;
+            }
+
+            if (key == Key.E || key == Key.F)
+            {
+                ShowSearchBox(selectAll: true);
+                return true;
+            }
+
+            return false;
+        }
+
+        private void AddStyledRun(TextBlock textBlock, string text, Brush brush, double fontScale, FontFamily fontFamily, bool highlight)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return;
+            }
+
             var run = new Run(text);
             if (brush != null)
             {
                 run.Foreground = brush;
+            }
+
+            if (highlight)
+            {
+                run.Background = _searchMatchBrush;
             }
 
             if (fontScale > 0 && Math.Abs(fontScale - 1.0) > 0.001)
@@ -1540,6 +1779,12 @@ namespace ColorCallStack
                 return;
             }
 
+            if (TryHandleShortcut(e.Key, Keyboard.Modifiers))
+            {
+                e.Handled = true;
+                return;
+            }
+
             if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
             {
                 return;
@@ -1557,6 +1802,105 @@ namespace ColorCallStack
                 RequestFontSizeStep(-1);
                 e.Handled = true;
             }
+        }
+
+        private void SearchTextBox_OnTextChanged(object sender, TextChangedEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            _pendingSearchText = SearchTextBox?.Text ?? string.Empty;
+            if (string.Equals(_searchText, _pendingSearchText, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _searchRefreshTimer.Stop();
+            _searchRefreshTimer.Start();
+        }
+
+        private void SearchRefreshTimer_OnTick(object sender, EventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            _searchRefreshTimer.Stop();
+            ApplySearchTextNow(_pendingSearchText);
+        }
+
+        private void SearchTextBox_OnPreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (e.Key == Key.Escape)
+            {
+                HideSearchBox(clearSearchText: true);
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Key == Key.Enter)
+            {
+                _searchRefreshTimer.Stop();
+                ApplySearchTextNow(SearchTextBox?.Text ?? string.Empty);
+                FramesList?.Focus();
+                e.Handled = true;
+                return;
+            }
+
+            if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 &&
+                (e.Key == Key.E || e.Key == Key.F))
+            {
+                SearchTextBox?.SelectAll();
+                e.Handled = true;
+            }
+        }
+
+        private void ShowSearchBox(bool selectAll)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (SearchPanel != null)
+            {
+                SearchPanel.Visibility = Visibility.Visible;
+            }
+
+            if (SearchTextBox != null)
+            {
+                SearchTextBox.Focus();
+                if (selectAll)
+                {
+                    SearchTextBox.SelectAll();
+                }
+            }
+        }
+
+        private void HideSearchBox(bool clearSearchText)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            if (SearchPanel != null)
+            {
+                SearchPanel.Visibility = Visibility.Collapsed;
+            }
+
+            if (clearSearchText)
+            {
+                _searchRefreshTimer.Stop();
+                ApplySearchTextNow(string.Empty);
+                if (SearchTextBox != null)
+                {
+                    SearchTextBox.Text = string.Empty;
+                }
+            }
+
+            FramesList?.Focus();
+        }
+
+        private void ApplySearchTextNow(string nextSearchText)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            _pendingSearchText = nextSearchText ?? string.Empty;
+            if (string.Equals(_searchText, _pendingSearchText, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _searchText = _pendingSearchText;
+            RefreshRenderedRows();
         }
 
         private void MenuDisplayHex_OnClick(object sender, RoutedEventArgs e)
@@ -1611,6 +1955,37 @@ namespace ColorCallStack
             }
         }
 
+        private void RefreshRenderedRows()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            foreach (var item in FramesList.Items)
+            {
+                if (!(item is ListBoxItem listItem) || !(listItem.Tag is FrameRowInfo info))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (info.FunctionText != null)
+                    {
+                        info.FunctionText.Inlines.Clear();
+                        BuildFrameInlines(info.FunctionText, info, includeArguments: info.HasDetails, includeLineNumbers: true);
+                    }
+
+                    if (info.FileText != null)
+                    {
+                        info.FileText.Inlines.Clear();
+                        BuildFileInlines(info.FileText, info, includeFileInfo: true);
+                    }
+                }
+                catch
+                {
+                    // Keep the list responsive if one frame fails to format.
+                }
+            }
+        }
+
         private void UpdateContextMenuChecks()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
@@ -1651,9 +2026,40 @@ namespace ColorCallStack
             {
                 if (item is ListBoxItem listItem && listItem.Tag is FrameRowInfo info)
                 {
-                    info.UpdateBackground(listItem.IsSelected, _currentFrameBrush);
+                    info.UpdateBackground(listItem.IsSelected, _currentFrameBrush, GetNamespaceGroupBrush(info.NamespaceGroupIndex));
                 }
             }
+        }
+
+        private Brush ResolveRowBackground(bool isCurrent, bool isSelected, int namespaceGroupIndex)
+        {
+            if (isSelected)
+            {
+                return Brushes.Transparent;
+            }
+
+            if (isCurrent)
+            {
+                return _currentFrameBrush;
+            }
+
+            return GetNamespaceGroupBrush(namespaceGroupIndex);
+        }
+
+        private Brush GetNamespaceGroupBrush(int namespaceGroupIndex)
+        {
+            if (_namespaceGroupBrushes == null || _namespaceGroupBrushes.Length == 0)
+            {
+                return Brushes.Transparent;
+            }
+
+            if (namespaceGroupIndex < 0)
+            {
+                return Brushes.Transparent;
+            }
+
+            int index = namespaceGroupIndex % _namespaceGroupBrushes.Length;
+            return _namespaceGroupBrushes[index] ?? Brushes.Transparent;
         }
 
         private void BeginPopulateDetails()
@@ -1710,13 +2116,14 @@ namespace ColorCallStack
                         if (info.FunctionText != null)
                         {
                             info.FunctionText.Inlines.Clear();
-                            BuildFrameInlines(info.FunctionText, info.Frame, includeArguments: true);
+                            BuildFrameInlines(info.FunctionText, info, includeArguments: true, includeLineNumbers: true);
+                            info.MarkDetailsPopulated();
                         }
 
                         if (info.FileText != null)
                         {
                             info.FileText.Inlines.Clear();
-                            BuildFileInlines(info.FileText, info.Frame, includeFileInfo: true);
+                            BuildFileInlines(info.FileText, info, includeFileInfo: true);
                         }
                     }
                     catch
@@ -1770,6 +2177,7 @@ namespace ColorCallStack
         private void OnUnloaded(object sender, RoutedEventArgs e)
         {
             ThreadHelper.ThrowIfNotOnUIThread();
+            _searchRefreshTimer.Stop();
             if (!_themeHooked)
             {
                 return;
@@ -1791,13 +2199,26 @@ namespace ColorCallStack
 
         private sealed class FrameRowInfo
         {
-            public FrameRowInfo(StackFrame frame, Border border, TextBlock functionText, TextBlock fileText, bool isCurrent)
+            public FrameRowInfo(
+                StackFrame frame,
+                Border border,
+                TextBlock functionText,
+                TextBlock fileText,
+                bool isCurrent,
+                int namespaceGroupIndex,
+                string namespacePart,
+                string functionPart,
+                string frameCacheKey)
             {
                 Frame = frame;
                 Border = border;
                 FunctionText = functionText;
                 FileText = fileText;
                 IsCurrent = isCurrent;
+                NamespaceGroupIndex = namespaceGroupIndex;
+                NamespacePart = namespacePart ?? string.Empty;
+                FunctionPart = string.IsNullOrEmpty(functionPart) ? "<unknown>" : functionPart;
+                FrameCacheKey = frameCacheKey ?? string.Empty;
             }
 
             public StackFrame Frame { get; }
@@ -1805,17 +2226,72 @@ namespace ColorCallStack
             public TextBlock FunctionText { get; }
             public TextBlock FileText { get; }
             public bool IsCurrent { get; }
+            public int NamespaceGroupIndex { get; }
+            public string NamespacePart { get; }
+            public string FunctionPart { get; }
+            public string FrameCacheKey { get; }
+            public bool HasDetails { get; private set; }
+            public bool SourceInfoComputed { get; private set; }
+            public string FileName { get; private set; }
+            public int LineNumber { get; private set; }
+            public bool ArgumentsComputed { get; private set; }
+            public List<ArgumentPart> Arguments { get; private set; }
 
-            public void UpdateBackground(bool isSelected, Brush currentBrush)
+            public void MarkDetailsPopulated()
             {
-                if (!IsCurrent)
+                HasDetails = true;
+            }
+
+            public void SetSourceInfo(string filePath, int lineNumber)
+            {
+                if (string.IsNullOrEmpty(filePath))
+                {
+                    FileName = null;
+                }
+                else
+                {
+                    string shortName = System.IO.Path.GetFileName(filePath);
+                    FileName = string.IsNullOrEmpty(shortName) ? filePath : shortName;
+                }
+
+                LineNumber = lineNumber > 0 ? lineNumber : 0;
+                SourceInfoComputed = true;
+            }
+
+            public void SetArguments(List<ArgumentPart> arguments)
+            {
+                Arguments = arguments;
+                ArgumentsComputed = true;
+            }
+
+            public void UpdateBackground(bool isSelected, Brush currentBrush, Brush groupBrush)
+            {
+                if (isSelected)
                 {
                     Border.Background = Brushes.Transparent;
                     return;
                 }
 
-                Border.Background = isSelected ? Brushes.Transparent : currentBrush;
+                if (IsCurrent)
+                {
+                    Border.Background = currentBrush;
+                    return;
+                }
+
+                Border.Background = groupBrush ?? Brushes.Transparent;
             }
+        }
+
+        private readonly struct SourceInfoCacheEntry
+        {
+            public SourceInfoCacheEntry(string fileName, int lineNumber)
+            {
+                FileName = fileName;
+                LineNumber = lineNumber;
+            }
+
+            public string FileName { get; }
+            public int LineNumber { get; }
         }
 
         internal readonly struct Palette

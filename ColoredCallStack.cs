@@ -1,6 +1,8 @@
-﻿using Microsoft.VisualStudio.Shell;
+using Microsoft.VisualStudio.Shell;
 using System;
 using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using System.Windows.Input;
 
 namespace ColorCallStack
 {
@@ -29,6 +31,25 @@ namespace ColorCallStack
             // we are not calling Dispose on this object. This is because ToolWindowPane calls Dispose on
             // the object returned by the Content property.
             this.Content = new ColoredCallStackControl();
+        }
+
+        protected override bool PreProcessMessage(ref Message m)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            const int WM_KEYDOWN = 0x0100;
+            const int WM_SYSKEYDOWN = 0x0104;
+
+            if (m.Msg == WM_KEYDOWN || m.Msg == WM_SYSKEYDOWN)
+            {
+                var key = KeyInterop.KeyFromVirtualKey((int)m.WParam);
+                ModifierKeys modifiers = Keyboard.Modifiers;
+                if (Content is ColoredCallStackControl control && control.TryHandleShortcut(key, modifiers))
+                {
+                    return true;
+                }
+            }
+
+            return base.PreProcessMessage(ref m);
         }
     }
 }

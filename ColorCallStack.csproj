@@ -87,6 +87,10 @@
     </Page>
   </ItemGroup>
   <ItemGroup>
+    <Content Include="ColoredCallStackIcon2.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <IncludeInVSIX>true</IncludeInVSIX>
+    </Content>
     <Content Include="Resources\ColoredCallStackIcon.png">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>

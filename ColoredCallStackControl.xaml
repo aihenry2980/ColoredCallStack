@@ -10,7 +10,31 @@
              d:DesignHeight="300" d:DesignWidth="300"
              Name="MyToolWindow">
     <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Border x:Name="SearchPanel"
+                Grid.Row="0"
+                Visibility="Collapsed"
+                Padding="6,4"
+                Background="{DynamicResource {x:Static vsshell:VsBrushes.CommandBarMenuBackgroundGradientBeginKey}}">
+            <DockPanel LastChildFill="True">
+                <TextBlock Text="Search:"
+                           VerticalAlignment="Center"
+                           Foreground="{DynamicResource {x:Static vsshell:VsBrushes.WindowTextKey}}" />
+                <TextBox x:Name="SearchTextBox"
+                         Margin="6,0,0,0"
+                         MinWidth="140"
+                         VerticalContentAlignment="Center"
+                         TextChanged="SearchTextBox_OnTextChanged"
+                         PreviewKeyDown="SearchTextBox_OnPreviewKeyDown" />
+            </DockPanel>
+        </Border>
+
         <ListBox x:Name="FramesList"
+                 Grid.Row="1"
                  SelectionMode="Single"
                  BorderThickness="0"
                  Background="{DynamicResource {x:Static vsshell:VsBrushes.WindowKey}}"
