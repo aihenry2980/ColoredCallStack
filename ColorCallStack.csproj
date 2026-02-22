@@ -87,10 +87,23 @@
     </Page>
   </ItemGroup>
   <ItemGroup>
+    <Content Include="ColorCallStackIcon_128.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <IncludeInVSIX>true</IncludeInVSIX>
+    </Content>
+    <Content Include="ColorCallStackIcon_256.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <IncludeInVSIX>true</IncludeInVSIX>
+    </Content>
+    <Content Include="ColorCallStackIcon_512.png">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <IncludeInVSIX>true</IncludeInVSIX>
+    </Content>
     <Content Include="ColoredCallStackIcon2.png">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
+    <Content Include="Resources\ColorCallStackIcon_256.png" />
     <Content Include="Resources\ColoredCallStackIcon.png">
       <IncludeInVSIX>true</IncludeInVSIX>
     </Content>
